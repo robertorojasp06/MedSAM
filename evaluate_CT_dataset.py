@@ -414,7 +414,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--threads',
         type=int,
-        default=4,
+        default=8,
         help="Maximum number of concurrent threads for CPU tasks."
     )
     parser.add_argument(
