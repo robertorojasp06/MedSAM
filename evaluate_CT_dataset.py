@@ -331,7 +331,7 @@ class Evaluator:
             ax[2].imshow(img_3c)
             show_mask(medsam_seg, ax[2])
             show_box(bbox['bbox_original'].squeeze(), ax[2])
-            ax[2].set_title("MedSAM Segmentation")
+            ax[2].set_title(f"MedSAM Segmentation (Dice={round(dice_score, 3)})")
             plt.tight_layout()
             plt.savefig(path_to_output_overlapped / f"{path_to_embedding.name.split('.pt')[0]}_bbox{bbox_idx}.png")
             plt.close()
@@ -417,6 +417,13 @@ if __name__ == "__main__":
         default=4,
         help="Maximum number of concurrent threads for CPU tasks."
     )
+    parser.add_argument(
+        '--inference_only',
+        dest='inference_only',
+        action='store_true',
+        help="""Add this argument to execute only inference. Require
+        the previous outputs in the specified output folder."""
+    )
     args = parser.parse_args()
     window = windows.get(args.window, None)
     evaluator = Evaluator(
@@ -426,11 +433,23 @@ if __name__ == "__main__":
         dataset_fname_relation=args.dataset_fname_relation,
         foreground_label=args.foreground_label
     )
-    results = evaluator.run_evaluation(
-        args.path_to_checkpoint,
-        window,
-        args.threads
-    )
+    if args.inference_only:
+        with open(Path(args.path_to_output) / 'slices.pkl', 'rb') as file:
+            slices = pickle.load(file)
+        with open(Path(args.path_to_output) / 'bboxes.pkl', 'rb') as file:
+            bboxes = pickle.load(file)
+        performance = evaluator._run_inference(bboxes, args.path_to_checkpoint)
+        results = {
+            "slices": slices,
+            "bboxes": bboxes,
+            "performance": performance
+        }        
+    else:
+        results = evaluator.run_evaluation(
+            args.path_to_checkpoint,
+            window,
+            args.threads
+        )
     with open(Path(args.path_to_output) / 'slices.pkl', 'wb') as file:
         pickle.dump(results["slices"], file)
     with open(Path(args.path_to_output) / 'bboxes.pkl', 'wb') as file:
