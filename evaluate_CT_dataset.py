@@ -79,7 +79,7 @@ def medsam_inference(medsam_model, img_embed, box_1024, H, W):
 class Evaluator:
     """Run evaluation of MedSAM model on CT dataset."""
     def __init__(self, path_to_cts, path_to_masks, path_to_output, device='cuda:0',
-                 dataset_fname_relation='equal_name', foreground_label=1) -> None:
+                 dataset_fname_relation='same_name', foreground_label=1) -> None:
         self.path_to_cts = path_to_cts
         self.path_to_masks = path_to_masks
         self.path_to_output = path_to_output
@@ -107,7 +107,7 @@ class Evaluator:
         for path in tqdm(paths_to_masks):
             mask = np.uint8(sitk.GetArrayFromImage(sitk.ReadImage(path)))
             if np.any(mask == 1):
-                if self.dataset_fname_relation == 'msd':
+                if self.dataset_fname_relation == 'nnunet':
                     ct_fname = f"{path.name.split(self._input_fname_extension)[0]}_0000{self._input_fname_extension}"
                 else:
                     ct_fname = path.name
@@ -129,7 +129,8 @@ class Evaluator:
         return slices
 
     def _preprocess_ct(self, ct):
-        """Preprocess slices from a CT volume according to the MedSAM pipeline."""
+        """Preprocess slices from a CT volume according to the MedSAM
+        pipeline."""
         ct_fname = ct["ct_fname"]
         ct_slice_inds = ct["ct_slice_inds"]
         window = ct["window"]
@@ -142,7 +143,7 @@ class Evaluator:
         path_to_out_preprocessed.mkdir(exist_ok=True)
         path_to_original_size.mkdir(exist_ok=True)
         # CT normalization
-        if window["L"] and window["W"]:
+        if window:
             lower_bound = window["L"] - window["W"] / 2
             upper_bound = window["L"] + window["W"] / 2
             ct_array_pre = np.clip(ct_array, lower_bound, upper_bound)
@@ -188,6 +189,8 @@ class Evaluator:
             )
 
     def _preprocess_slices(self, slices, window, threads):
+        """Preprocess the input set of slices according to the
+        MedSAM pipeline."""
         unique_cts = [item["ct_fname"] for item in slices]
         unique_cts = list(set(unique_cts))
         ct_to_slices = {item: [] for item in unique_cts}
@@ -260,7 +263,7 @@ class Evaluator:
         return bboxes
 
     def _run_inference(self, bboxes, path_to_checkpoint):
-        """Run inference on bboxes grouped in batches."""
+        """Run inference on bboxes."""
         path_to_gt_masks = Path(self.path_to_output) / self._gt_masks_suffix
         path_to_output_masks = Path(self.path_to_output) / self._output_masks_suffix
         path_to_output_overlapped = Path(self.path_to_output) / self._output_overlapped_suffix
@@ -299,8 +302,8 @@ class Evaluator:
                 "bbox_fname": bbox_fname,
                 "bbox_original": bbox["bbox_original"].squeeze().tolist(),
                 "bbox_1024": bbox["bbox_1024"].squeeze().tolist(),
-                "annotated_pixels": np.sum(gt_mask > 0),
-                "predicted_pixels": np.sum(medsam_seg > 0),
+                "annotated_pixels": int(np.sum(gt_mask > 0)),
+                "predicted_pixels": int(np.sum(medsam_seg > 0)),
                 "dice_score": dice_score
             })
             performance.append(performance_dict)
@@ -334,49 +337,105 @@ class Evaluator:
             plt.close()
         return performance
 
-    def run_evaluation(self, path_to_checkpoint, window={"L": None, "W":None}):
-        """Run MedSAM inference on bounding boxes and measure the Dice
-        coefficient."""
+    def run_evaluation(self, path_to_checkpoint, window=None, threads=1):
+        """Run MedSAM inference on bounding boxes and measure the
+        Dice coefficient."""
         assert torch.cuda.is_available(), "You need GPU and CUDA to make the evaluation."
         slices = self._identify_slices()
-        self._preprocess_slices(slices, window)
+        self._preprocess_slices(slices, window, threads)
         self._compute_image_embeddings(slices, path_to_checkpoint)
         bboxes = self._compute_bounding_boxes(slices)
         performance = self._run_inference(bboxes, path_to_checkpoint)
+        results = {
+            "slices": slices,
+            "bboxes": bboxes,
+            "performance": performance
+        }
+        return results
 
 
 if __name__ == "__main__":
-    path_to_cts = '/media/cosmo/Data/fondef_ID23I10337/nnUNet/data/raw/Dataset506_Task06_Lung/imagesTr'
-    path_to_masks = '/media/cosmo/Data/fondef_ID23I10337/nnUNet/data/raw/Dataset506_Task06_Lung/labelsTr'
-    path_to_output = '/home/cosmo/medsam-evaluation'
-    path_to_checkpoint = 'work_dir/MedSAM/medsam_vit_b.pth'
-    window = {"L": -500, "W":1400}
-    from_slices = False
-    from_bboxes = False
-    evaluator = Evaluator(
-        path_to_cts=path_to_cts,
-        path_to_masks=path_to_masks,
-        path_to_output=path_to_output,
-        dataset_fname_relation='msd',
-        foreground_label=1
+    windows = {
+        "lung": {"L": -500, "W": 1400},
+        "abdomen": {"L": 40, "W": 350},
+        "bone": {"L": 400, "W": 1000},
+        "air": {"L": -426, "W": 1000},
+        "brain": {"L": 50, "W": 100}
+    }
+    parser = argparse.ArgumentParser(
+        description="""Evaluate MedSAM on a CT dataset with annotated
+        masks.""",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    if not from_bboxes:
-        if not from_slices:
-            slices = evaluator._identify_slices()
-            with open(Path(path_to_output) / 'slices.pkl', 'wb') as file:
-                pickle.dump(slices, file)
-        else:
-            with open(Path(path_to_output) / 'slices.pkl', 'rb') as file:
-                slices = pickle.load(file)
-        print(f"slices_count: {len(slices)}")
-        evaluator._preprocess_slices(slices, window=window, threads=8)
-        evaluator._compute_image_embeddings(slices, path_to_checkpoint)
-        bboxes = evaluator._compute_bounding_boxes(slices)
-        with open(Path(path_to_output) / 'bboxes.pkl', 'wb') as file:
-            pickle.dump(bboxes, file)
-    else:
-        with open(Path(path_to_output) / 'bboxes.pkl', 'rb') as file:
-            bboxes = pickle.load(file)
-    performance = evaluator._run_inference(bboxes, path_to_checkpoint)
-    with open(Path(path_to_output) / 'performance.json', 'w') as file:
-        json.dump(performance, file, indent=4)
+    parser.add_argument(
+        'path_to_cts',
+        type=str,
+        help="""Path to the directory with CT studies in NIfTI format
+        (.nii.gz)."""
+    )
+    parser.add_argument(
+        'path_to_masks',
+        type=str,
+        help="""Path to the directory with corresponding masks in NIfTI
+        format (.nii.gz)."""
+    )
+    parser.add_argument(
+        'path_to_output',
+        type=str,
+        help="Path to the directory to save output results."
+    )
+    parser.add_argument(
+        '--path_to_checkpoint',
+        type=str,
+        default="work_dir/MedSAM/medsam_vit_b.pth",
+        help="Path to the checkpoint model."
+    )
+    parser.add_argument(
+        '--window',
+        choices=list(windows.keys()),
+        default=None,
+        help="Window for CT normalization."
+    )
+    parser.add_argument(
+        '--dataset_fname_relation',
+        choices=['nnunet', 'same_name'],
+        default='nnunet',
+        help="""Relation between CT studies and masks filenames.
+        'nnunet' means nnUNet pipeline filenames format, and 'same_name'
+         means CT and mask NIfTI volumes have the same filename."""
+    )
+    parser.add_argument(
+        '--foreground_label',
+        type=int,
+        default=1,
+        help="""Integer label corresponding to the foreground class in
+        the annotated masks."""
+    )
+    parser.add_argument(
+        '--threads',
+        type=int,
+        default=4,
+        help="Maximum number of concurrent threads for CPU tasks."
+    )
+    args = parser.parse_args()
+    window = windows.get(args.window, None)
+    evaluator = Evaluator(
+        path_to_cts=args.path_to_cts,
+        path_to_masks=args.path_to_masks,
+        path_to_output=args.path_to_output,
+        dataset_fname_relation=args.dataset_fname_relation,
+        foreground_label=args.foreground_label
+    )
+    results = evaluator.run_evaluation(
+        args.path_to_checkpoint,
+        window,
+        args.threads
+    )
+    with open(Path(args.path_to_output) / 'slices.pkl', 'wb') as file:
+        pickle.dump(results["slices"], file)
+    with open(Path(args.path_to_output) / 'bboxes.pkl', 'wb') as file:
+        pickle.dump(results["bboxes"], file)
+    with open(Path(args.path_to_output) / 'performance.json', 'w') as file:
+        json.dump(results["performance"], file, indent=4)
+    with open(Path(args.path_to_output) / 'arguments.json', 'w') as file:
+        json.dump({**vars(args), "window_L_W": window}, file, indent=4)
