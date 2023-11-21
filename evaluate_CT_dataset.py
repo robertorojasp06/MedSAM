@@ -153,9 +153,8 @@ class Evaluator:
                 * 255.0
             )
         else:
-            lower_bound, upper_bound = np.percentile(
-                ct_array[ct_array > 0], 0.5
-            ), np.percentile(ct_array[ct_array > 0], 99.5)
+            lower_bound= np.percentile(ct_array[ct_array > 0], 0.5)
+            upper_bound = np.percentile(ct_array[ct_array > 0], 99.5)
             ct_array_pre = np.clip(ct_array, lower_bound, upper_bound)
             ct_array_pre = (
                 (ct_array_pre - np.min(ct_array_pre) + self._epsilon)
@@ -394,7 +393,8 @@ if __name__ == "__main__":
         '--window',
         choices=list(windows.keys()),
         default=None,
-        help="Window for CT normalization."
+        help="""Window for CT normalization. If None, values are clipped
+        to percentiles 0.5 and 99.5, and then mapped to the range 0-255."""
     )
     parser.add_argument(
         '--dataset_fname_relation',
