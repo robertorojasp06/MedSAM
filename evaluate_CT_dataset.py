@@ -399,7 +399,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--dataset_fname_relation',
         choices=['nnunet', 'same_name'],
-        default='nnunet',
+        default='same_name',
         help="""Relation between CT studies and masks filenames.
         'nnunet' means nnUNet pipeline filenames format, and 'same_name'
          means CT and mask NIfTI volumes have the same filename."""
