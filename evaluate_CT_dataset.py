@@ -1,3 +1,6 @@
+import matplotlib
+matplotlib.use('agg')  # Set the 'agg' backend explicitly before using Matplotlib in threads
+
 import argparse
 import numpy as np
 import SimpleITK as sitk
@@ -7,11 +10,15 @@ import concurrent.futures
 import matplotlib.pyplot as plt
 import pickle
 import json
+import pandas as pd
+import torch.multiprocessing as mp
+import time
 from pathlib import Path
 from skimage import io, transform
 from skimage.measure import label, regionprops
 from segment_anything import sam_model_registry
 from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
 
 
 def show_mask(mask, ax, random_color=False):
@@ -44,41 +51,52 @@ def dice_coefficient(reference, prediction, are_binary=False):
     return dice_score
 
 
-@torch.no_grad()
-def medsam_inference(medsam_model, img_embed, box_1024, H, W):
-    box_torch = torch.as_tensor(box_1024, dtype=torch.float, device=img_embed.device)
-    if len(box_torch.shape) == 2:
-        box_torch = box_torch[:, None, :]  # (B, 1, 4)
+class BBoxDataset(Dataset):
+    def __init__(self, path_to_slices, path_to_bboxes_1024,
+                 bbox_mapping, device) -> None:
+        self.path_to_slices = path_to_slices
+        self.path_to_bboxes_1024 = path_to_bboxes_1024
+        self.bbox_mapping = bbox_mapping
+        self.device = device
 
-    sparse_embeddings, dense_embeddings = medsam_model.prompt_encoder(
-        points=None,
-        boxes=box_torch,
-        masks=None,
-    )
-    low_res_logits, _ = medsam_model.mask_decoder(
-        image_embeddings=img_embed,  # (B, 256, 64, 64)
-        image_pe=medsam_model.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
-        sparse_prompt_embeddings=sparse_embeddings,  # (B, 2, 256)
-        dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
-        multimask_output=False,
-    )
+    @property
+    def bbox_mapping(self):
+        return self._bbox_mapping
 
-    low_res_pred = torch.sigmoid(low_res_logits)  # (1, 1, 256, 256)
+    @bbox_mapping.setter
+    def bbox_mapping(self, value):
+        self._bbox_mapping = pd.DataFrame(value)
 
-    low_res_pred = F.interpolate(
-        low_res_pred,
-        size=(H, W),
-        mode="bilinear",
-        align_corners=False,
-    )  # (1, 1, gt.shape)
-    low_res_pred = low_res_pred.squeeze().cpu().numpy()  # (256, 256)
-    medsam_seg = (low_res_pred > 0.5).astype(np.uint8)
-    return medsam_seg
+    def __len__(self):
+        return len(self.bbox_mapping)
+
+    def __getitem__(self, index):
+        path_to_slice = Path(self.path_to_slices) / self.bbox_mapping.loc[index, "preprocessed_slice"]
+        path_to_bbox_1024 = Path(self.path_to_bboxes_1024) / self.bbox_mapping.loc[index, "study"] / self.bbox_mapping.loc[index, "bbox_1024"]
+        slice_1024 = io.imread(path_to_slice)
+        with open(path_to_bbox_1024, 'rb') as file:
+            bbox_1024 = np.load(file)
+        # normalize to [0, 1], (H, W, 3)
+        slice_1024 = (slice_1024 - slice_1024.min()) / np.clip(
+            slice_1024.max() - slice_1024.min(), a_min=1e-8, a_max=None
+        )
+        # convert the shape to (3, H, W)
+        slice_1024_tensor = (
+            torch.tensor(slice_1024).float().permute(2, 0, 1).to(self.device)
+        )
+        # convert bbox to tensor
+        bbox_1024_tensor = torch.as_tensor(bbox_1024, dtype=torch.float).to(self.device)
+        return (index,
+                slice_1024_tensor,
+                bbox_1024_tensor,
+                self.bbox_mapping.at[index, "slice_rows"],
+                self.bbox_mapping.at[index, "slice_cols"])
 
 
 class Evaluator:
     """Run evaluation of MedSAM model on CT dataset."""
-    def __init__(self, path_to_cts, path_to_masks, path_to_output, device='cuda:0',
+    def __init__(self, path_to_cts, path_to_masks, path_to_output,
+                 device='cuda:0', num_workers=4, batch_size=8, threads=8,
                  dataset_fname_relation='same_name', foreground_label=1) -> None:
         self.path_to_cts = path_to_cts
         self.path_to_masks = path_to_masks
@@ -86,11 +104,16 @@ class Evaluator:
         self.foreground_label = foreground_label
         self.dataset_fname_relation = dataset_fname_relation
         self.device = device
+        self.num_workers = num_workers
+        self.batch_size = batch_size
+        self.threads = threads
         self._input_fname_extension = '.nii.gz'
         self._original_suffix = "original_size"
         self._preprocessed_suffix = "preprocessed"
         self._embeddings_suffix = "embedding"
         self._gt_masks_suffix = "gt_masks"
+        self._bbox_original_suffix = "bboxes_original"
+        self._bbox1024_suffix = "bboxes_1024"
         self._output_masks_suffix = "output_masks"
         self._output_overlapped_suffix = "output_overlapped"
         self._epsilon = 1e-6
@@ -98,6 +121,7 @@ class Evaluator:
     def _identify_slices(self):
         """Return a list with dictionaries of each slice containing
         2D connected components."""
+        print("Identifying annotated slices ...")
         paths_to_masks = [
             item
             for item in Path(self.path_to_masks).glob(f"*{self._input_fname_extension}")
@@ -121,6 +145,7 @@ class Evaluator:
                             "dataset_fname_relation": self.dataset_fname_relation,
                             "mask_fname": path.name,
                             "ct_fname": ct_fname,
+                            "study": ct_fname.split(self._input_fname_extension)[0],
                             "slice_idx": idx,
                             "slice_rows": slice_.shape[0],
                             "slice_cols": slice_.shape[1]
@@ -187,9 +212,10 @@ class Evaluator:
                 check_contrast=False
             )
 
-    def _preprocess_slices(self, slices, window, threads):
+    def _preprocess_slices(self, slices, window):
         """Preprocess the input set of slices according to the
         MedSAM pipeline."""
+        print("Preprocessing CTs and slices ...")
         unique_cts = [item["ct_fname"] for item in slices]
         unique_cts = list(set(unique_cts))
         ct_to_slices = {item: [] for item in unique_cts}
@@ -203,148 +229,229 @@ class Evaluator:
                 "window": window
             }
             cts.append(ct)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
             executor.map(self._preprocess_ct, cts)
 
-
-    def _compute_image_embeddings(self, slices, path_to_checkpoint):
-        """Compute image embeddings and save them as torch arrays."""
-        path_to_embedding_output = Path(self.path_to_output) / self._embeddings_suffix
-        path_to_embedding_output.mkdir(exist_ok=True)
-        medsam_model = sam_model_registry["vit_b"](checkpoint=path_to_checkpoint)
-        medsam_model = medsam_model.to(self.device)
-        medsam_model.eval()
-        for slice_ in tqdm(slices):
-            path_to_slice = (Path(slice_["path_to_output"]) /
-                                self._preprocessed_suffix /
-                                f"{slice_['ct_fname'].split(self._input_fname_extension)[0]}_slice{slice_['slice_idx']}.png"
-                            )
-            slice_1024 = io.imread(path_to_slice)
-            # normalize to [0, 1], (H, W, 3)
-            slice_1024 = (slice_1024 - slice_1024.min()) / np.clip(
-                slice_1024.max() - slice_1024.min(), a_min=1e-8, a_max=None
+    def _compute_bounding_box_slice(self, slice_):
+        """Compute bounding boxes for a single slice."""
+        print(f"study: {slice_['study']}, slice: {slice_['slice_idx']}, processing ...")
+        path_to_mask= (
+            Path(slice_['path_to_masks']) /
+            slice_['mask_fname']
+        )
+        mask = sitk.GetArrayFromImage(sitk.ReadImage(path_to_mask))[slice_['slice_idx']]
+        labeled = label(mask == self.foreground_label)
+        props = regionprops(labeled)
+        H, W = slice_['slice_rows'], slice_['slice_cols']
+        bboxes_slice = [
+            {
+                **slice_,
+                "bbox_original": np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]]),
+                "bbox_1024": np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]]) / np.array([W, H, W, H]) * 1024,
+                "object_coords": object['coords']
+            }
+            for object in props
+        ]
+        for bbox in bboxes_slice:
+            path_to_bbox_original = (
+                Path(self.path_to_output) /
+                self._bbox_original_suffix /
+                bbox['study'] /
+                f"{bbox['study']}_sliceidx{slice_['slice_idx']}_{bbox['bbox_original'].squeeze()[0]}_{bbox['bbox_original'].squeeze()[1]}_{bbox['bbox_original'].squeeze()[2]}_{bbox['bbox_original'].squeeze()[3]}.npy"
             )
-            # convert the shape to (3, H, W)
-            slice_1024_tensor = (
-                torch.tensor(slice_1024).float().permute(2, 0, 1).unsqueeze(0).to(self.device)
+            path_to_bbox1024 = (
+                Path(self.path_to_output) /
+                self._bbox1024_suffix /
+                bbox['study'] /
+                f"{bbox['study']}_sliceidx{slice_['slice_idx']}_{int(bbox['bbox_1024'].squeeze()[0])}_{int(bbox['bbox_1024'].squeeze()[1])}_{int(bbox['bbox_1024'].squeeze()[2])}_{int(bbox['bbox_1024'].squeeze()[3])}.npy"
             )
-            # Apply image encoder
-            with torch.no_grad():
-                image_embedding = medsam_model.image_encoder(slice_1024_tensor)  # (1, 256, 64, 64)
-            path_to_embedding = (path_to_embedding_output /
-                                 f"{path_to_slice.name.split('.png')[0]}.pt"
-            ) 
-            torch.save(image_embedding, path_to_embedding)
+            bbox.update({
+                "path_to_bbox_original": str(path_to_bbox_original),
+                "path_to_bbox_1024": str(path_to_bbox1024),
+                "path_to_preprocessed_slice": str(Path(self.path_to_output) / self._preprocessed_suffix / f"{bbox['study']}_slice{bbox['slice_idx']}.png")
+            })
+            for path, key in zip([path_to_bbox_original, path_to_bbox1024], ['bbox_original', 'bbox_1024']):
+                if not path.parent.exists():
+                    path.parent.mkdir(parents=True)
+                with open(path, 'wb') as file:
+                    np.save(file, bbox[key])
+        self._bboxes += bboxes_slice
 
     def _compute_bounding_boxes(self, slices):
         """Return a list of dictionaries for each bounding box
         [min_col, min_row, max_col, max_row]."""
-        bboxes = []
-        for slice_ in tqdm(slices):
-            path_to_mask= (
-                Path(slice_['path_to_masks']) /
-                slice_['mask_fname']
-            )
-            mask = sitk.GetArrayFromImage(sitk.ReadImage(path_to_mask))[slice_['slice_idx']]
-            labeled = label(mask == self.foreground_label)
-            props = regionprops(labeled)
-            H, W = slice_['slice_rows'], slice_['slice_cols']
-            bboxes_slice = [
-                {
-                    **slice_,
-                    "bbox_original": np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]]),
-                    "bbox_1024": np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]]) / np.array([W, H, W, H]) * 1024,
-                    "object_coords": object['coords']
-                }
-                for object in props
-            ]
-            bboxes += bboxes_slice
-        return bboxes
+        print("Computing bounding boxes ...")
+        self._bboxes = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+            executor.map(self._compute_bounding_box_slice, slices)
+        return self._bboxes
 
-    def _run_inference(self, bboxes, path_to_checkpoint):
+    @torch.no_grad()
+    def _run_inference(self, bbox_dataset, path_to_checkpoint):
         """Run inference on bboxes."""
-        path_to_gt_masks = Path(self.path_to_output) / self._gt_masks_suffix
+        print("Running inference ...")
         path_to_output_masks = Path(self.path_to_output) / self._output_masks_suffix
-        path_to_output_overlapped = Path(self.path_to_output) / self._output_overlapped_suffix
-        path_to_gt_masks.mkdir(exist_ok=True)
         path_to_output_masks.mkdir(exist_ok=True)
-        path_to_output_overlapped.mkdir(exist_ok=True)
+        dataloader = DataLoader(
+            bbox_dataset,
+            self.batch_size,
+            num_workers=self.num_workers
+        )
         medsam_model = sam_model_registry["vit_b"](checkpoint=path_to_checkpoint)
         medsam_model = medsam_model.to(self.device)
         medsam_model.eval()
-        performance = []
-        for bbox_idx, bbox in tqdm(enumerate(bboxes), total=len(bboxes)):
-            path_to_embedding = (
-                Path(bbox['path_to_output']) /
-                self._embeddings_suffix /
-                f"{bbox['ct_fname'].split(self._input_fname_extension)[0]}_slice{bbox['slice_idx']}.pt"
+        for index, slice_1024, bbox_1024, slice_rows, slice_cols in tqdm(dataloader):
+            # Apply image encoder
+            with torch.no_grad():
+                embedding_tensor = medsam_model.image_encoder(slice_1024)  # (1, 256, 64, 64)
+ 
+            # Apply bbox (prompt) encoder and mask decoder
+            sparse_embeddings, dense_embeddings = medsam_model.prompt_encoder(
+                points=None,
+                boxes=bbox_1024,
+                masks=None,
             )
-            embedding_tensor = torch.load(path_to_embedding)
-            medsam_seg = medsam_inference(
-                medsam_model,
-                embedding_tensor,
-                bbox['bbox_1024'],
-                bbox['slice_rows'],
-                bbox['slice_cols']
+            low_res_logits, _ = medsam_model.mask_decoder(
+                image_embeddings=embedding_tensor,  # (B, 256, 64, 64)
+                image_pe=medsam_model.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
+                sparse_prompt_embeddings=sparse_embeddings,  # (B, 2, 256)
+                dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
+                multimask_output=False,
             )
-            # measure and save performance
-            gt_mask = np.zeros((bbox['slice_rows'], bbox['slice_cols'])).astype(np.uint8)
-            gt_mask[bbox['object_coords'][:, 0], bbox['object_coords'][:, 1]] = 1
-            dice_score = dice_coefficient(gt_mask, medsam_seg, are_binary=False)
-            bbox_fname = f"{path_to_embedding.name.split('.pt')[0]}_bbox{bbox_idx}.png"
-            performance_dict = {
-                key: value
-                for key, value in bbox.items()
-                if key not in ('bbox_original', 'bbox_1024', 'object_coords')
-            }
-            performance_dict.update({
-                "bbox_fname": bbox_fname,
-                "bbox_original": bbox["bbox_original"].squeeze().tolist(),
-                "bbox_1024": bbox["bbox_1024"].squeeze().tolist(),
-                "annotated_pixels": int(np.sum(gt_mask > 0)),
-                "predicted_pixels": int(np.sum(medsam_seg > 0)),
-                "dice_score": dice_score
-            })
-            performance.append(performance_dict)
-            # save outputs
-            io.imsave(
-                Path(self.path_to_output) / self._gt_masks_suffix / bbox_fname,
-                np.uint8(gt_mask * 255.0),
-                check_contrast=False
-            )
-            io.imsave(
-                Path(self.path_to_output) / self._output_masks_suffix / bbox_fname,
-                np.uint8(medsam_seg * 255.0),
-                check_contrast=False
-            )
-            # plotting
-            img_3c = io.imread(Path(bbox['path_to_output']) / self._original_suffix / f"{path_to_embedding.name.split('.pt')[0]}.png")
-            _, ax = plt.subplots(1, 3, figsize=(15, 5))
-            ax[0].imshow(img_3c)
-            show_box(bbox['bbox_original'].squeeze(), ax[0])
-            ax[0].set_title("Input Image and Bounding Box")
-            ax[1].imshow(img_3c)
-            show_mask(gt_mask, ax[1])
-            show_box(bbox['bbox_original'].squeeze(), ax[1])
-            ax[1].set_title("Ground truth")
-            ax[2].imshow(img_3c)
-            show_mask(medsam_seg, ax[2])
-            show_box(bbox['bbox_original'].squeeze(), ax[2])
-            ax[2].set_title(f"MedSAM Segmentation (Dice={round(dice_score, 3)})")
-            plt.tight_layout()
-            plt.savefig(path_to_output_overlapped / f"{path_to_embedding.name.split('.pt')[0]}_bbox{bbox_idx}.png")
-            plt.close()
-        return performance
 
-    def run_evaluation(self, path_to_checkpoint, window=None, threads=1):
+            low_res_pred = torch.sigmoid(low_res_logits)  # (1, 1, 256, 256)
+
+            # save individual output masks in original resolution
+            for low_res_sample, fname_idx, H, W in zip(low_res_pred, index, slice_rows, slice_cols):
+                # print("inside loop for individual interpolation and saving")
+                low_res_sample = low_res_sample.unsqueeze(0)
+                fname_idx = fname_idx.item()
+                H = H.item()
+                W = W.item()
+                low_res_sample = F.interpolate(
+                    low_res_sample,
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                )  # (1, 1, gt.shape)
+                low_res_sample = low_res_sample.squeeze().cpu().numpy()  # (256, 256)
+                medsam_seg = (low_res_sample > 0.5).astype(np.uint8)
+                bbox_fname_sample = bbox_dataset.bbox_mapping.loc[fname_idx, "bbox_original"]
+                io.imsave(
+                    path_to_output_masks / f"{bbox_fname_sample.split('.npy')[0]}.png",
+                    np.uint8(medsam_seg * 255.0),
+                    check_contrast=False
+                )
+
+    def _compute_single_performance(self, bbox):
+        """Compute performance on a single bounding box."""
+        print(f"bbox: {Path(bbox['path_to_bbox_original']).name}, processing ...")
+        # read predicted mask in original size
+        path_to_output_overlapped = Path(self.path_to_output) / self._output_overlapped_suffix
+        path_to_output_mask = (
+            Path(self.path_to_output) /
+            self._output_masks_suffix /
+            f"{Path(bbox['path_to_bbox_original']).name.split('.npy')[0]}.png"
+        )
+        medsam_seg = np.uint8(io.imread(path_to_output_mask).astype('bool'))
+        # measure and save performance
+        gt_mask = np.zeros((bbox['slice_rows'], bbox['slice_cols'])).astype(np.uint8)
+        gt_mask[bbox['object_coords'][:, 0], bbox['object_coords'][:, 1]] = 1
+        dice_score = dice_coefficient(gt_mask, medsam_seg, are_binary=False)
+        bbox_fname = Path(bbox["path_to_bbox_original"]).name
+        performance = {
+            key: value
+            for key, value in bbox.items()
+            if key not in ('bbox_original', 'bbox_1024', 'object_coords')
+        }
+        performance.update({
+            "bbox_original_fname": bbox_fname,
+            "bbox_original": [int(item) for item in bbox["bbox_original"].squeeze().tolist()],
+            "bbox_1024": [int(item) for item in bbox["bbox_1024"].squeeze().tolist()],
+            "annotated_pixels": int(np.sum(gt_mask > 0)),
+            "predicted_pixels": int(np.sum(medsam_seg > 0)),
+            "dice_score": dice_score
+        })
+        self._performance.append(performance)
+        # save gt
+        bbox_fname_png = f"{bbox_fname.split('.npy')[0]}.png"
+        io.imsave(
+            Path(self.path_to_output) / self._gt_masks_suffix / bbox_fname_png,
+            np.uint8(gt_mask * 255.0),
+            check_contrast=False
+        )
+        # save plotting with overlapped output
+        img_3c = io.imread(
+            Path(bbox['path_to_output']) /
+            self._original_suffix /
+            f"{bbox['ct_fname'].split(self._input_fname_extension)[0]}_slice{bbox['slice_idx']}.png"
+        )
+        _, ax = plt.subplots(1, 3, figsize=(15, 5))
+        ax[0].imshow(img_3c)
+        show_box(bbox['bbox_original'].squeeze(), ax[0])
+        ax[0].set_title("Input Image and Bounding Box")
+        ax[1].imshow(img_3c)
+        show_mask(gt_mask, ax[1])
+        show_box(bbox['bbox_original'].squeeze(), ax[1])
+        ax[1].set_title("Ground truth")
+        ax[2].imshow(img_3c)
+        show_mask(medsam_seg, ax[2])
+        show_box(bbox['bbox_original'].squeeze(), ax[2])
+        ax[2].set_title(f"MedSAM Segmentation (Dice={round(dice_score, 3)})")
+        plt.tight_layout()
+        plt.savefig(path_to_output_overlapped / bbox_fname_png)
+        plt.close()
+
+    def _compute_performance(self, bboxes):
+        """Compute performance from predicted masks."""
+        print("Computing performance ...")
+        path_to_gt_masks = Path(self.path_to_output) / self._gt_masks_suffix
+        path_to_output_overlapped = Path(self.path_to_output) / self._output_overlapped_suffix
+        path_to_gt_masks.mkdir(exist_ok=True)
+        path_to_output_overlapped.mkdir(exist_ok=True)
+        self._performance = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+            executor.map(self._compute_single_performance, bboxes)
+        return self._performance
+
+    def run_evaluation(self, path_to_checkpoint, window=None):
         """Run MedSAM inference on bounding boxes and measure the
         Dice coefficient."""
         assert torch.cuda.is_available(), "You need GPU and CUDA to make the evaluation."
         slices = self._identify_slices()
-        self._preprocess_slices(slices, window, threads)
-        self._compute_image_embeddings(slices, path_to_checkpoint)
+        self._preprocess_slices(slices, window)
         bboxes = self._compute_bounding_boxes(slices)
-        performance = self._run_inference(bboxes, path_to_checkpoint)
+        bbox_mapping = [
+            {
+                "study": item["study"],
+                "slice_idx": item["slice_idx"],
+                "slice_rows": item["slice_rows"],
+                "slice_cols": item["slice_cols"],
+                "bbox_1024": Path(item["path_to_bbox_1024"]).name,
+                "row_min_1024": item["bbox_1024"].squeeze()[0],
+                "col_min_1024": item["bbox_1024"].squeeze()[1],
+                "row_max_1024": item["bbox_1024"].squeeze()[2],
+                "col_max_1024": item["bbox_1024"].squeeze()[3],
+                "preprocessed_slice": Path(item["path_to_preprocessed_slice"]).name,
+                "bbox_original": Path(item["path_to_bbox_original"]).name,
+                "row_min_original": item["bbox_original"].squeeze()[0],
+                "col_min_original": item["bbox_original"].squeeze()[1],
+                "row_max_original": item["bbox_original"].squeeze()[2],
+                "col_max_original": item["bbox_original"].squeeze()[3],
+            }
+            for item in bboxes
+        ]
+        bbox_dataset = BBoxDataset(
+            Path(self.path_to_output) / self._preprocessed_suffix,
+            Path(self.path_to_output) / self._bbox1024_suffix,
+            bbox_mapping,
+            self.device
+        )
+        self._run_inference(
+            bbox_dataset,
+            path_to_checkpoint
+        )
+        performance = self._compute_performance(bboxes)
         results = {
             "slices": slices,
             "bboxes": bboxes,
@@ -354,6 +461,7 @@ class Evaluator:
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn')
     windows = {
         "lung": {"L": -500, "W": 1400},
         "abdomen": {"L": 40, "W": 350},
@@ -418,11 +526,16 @@ if __name__ == "__main__":
         help="Maximum number of concurrent threads for CPU tasks."
     )
     parser.add_argument(
-        '--inference_only',
-        dest='inference_only',
-        action='store_true',
-        help="""Add this argument to execute only inference. Require
-        the previous outputs in the specified output folder."""
+        '--num_workers',
+        type=int,
+        default=4,
+        help="Max workers for GPU processing."
+    )
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=2,
+        help="Batch size for inference using GPU."
     )
     args = parser.parse_args()
     window = windows.get(args.window, None)
@@ -431,30 +544,35 @@ if __name__ == "__main__":
         path_to_masks=args.path_to_masks,
         path_to_output=args.path_to_output,
         dataset_fname_relation=args.dataset_fname_relation,
-        foreground_label=args.foreground_label
+        foreground_label=args.foreground_label,
+        threads=args.threads,
+        num_workers=args.num_workers,
+        batch_size=args.batch_size
     )
-    if args.inference_only:
-        with open(Path(args.path_to_output) / 'slices.pkl', 'rb') as file:
-            slices = pickle.load(file)
-        with open(Path(args.path_to_output) / 'bboxes.pkl', 'rb') as file:
-            bboxes = pickle.load(file)
-        performance = evaluator._run_inference(bboxes, args.path_to_checkpoint)
-        results = {
-            "slices": slices,
-            "bboxes": bboxes,
-            "performance": performance
-        }        
-    else:
-        results = evaluator.run_evaluation(
-            args.path_to_checkpoint,
-            window,
-            args.threads
-        )
+    start_time = time.time()
+    results = evaluator.run_evaluation(
+        args.path_to_checkpoint,
+        window
+    )
+    end_time = time.time()
+    execution_time = end_time - start_time
+    hours = int(execution_time // 3600)
+    minutes = int((execution_time % 3600) // 60)
+    seconds = int(execution_time % 60)
+    formatted_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    print(f"execution time (HH:MM:SS): {formatted_time}")
     with open(Path(args.path_to_output) / 'slices.pkl', 'wb') as file:
         pickle.dump(results["slices"], file)
     with open(Path(args.path_to_output) / 'bboxes.pkl', 'wb') as file:
         pickle.dump(results["bboxes"], file)
     with open(Path(args.path_to_output) / 'performance.json', 'w') as file:
-        json.dump(results["performance"], file, indent=4)
+        json.dump(
+            {
+                "bboxes": results["performance"],
+                "execution time (HH:MM:SS)": formatted_time
+            },
+            file,
+            indent=4
+        )
     with open(Path(args.path_to_output) / 'arguments.json', 'w') as file:
         json.dump({**vars(args), "window_L_W": window}, file, indent=4)
