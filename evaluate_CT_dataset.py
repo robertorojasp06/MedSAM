@@ -118,6 +118,31 @@ class Evaluator:
         self._output_overlapped_suffix = "output_overlapped"
         self._epsilon = 1e-6
 
+    def _identify_slices_in_mask(self, path_to_mask):
+        """Identify annotated slices in the specified mask."""
+        path_to_mask = Path(path_to_mask)
+        print(f"mask: {path_to_mask.name}, processing ...")
+        mask = np.uint8(sitk.GetArrayFromImage(sitk.ReadImage(path_to_mask)))
+        if np.any(mask == 1):
+            if self.dataset_fname_relation == 'nnunet':
+                ct_fname = f"{path_to_mask.name.split(self._input_fname_extension)[0]}_0000{self._input_fname_extension}"
+            else:
+                ct_fname = path_to_mask.name
+            for idx, slice_ in enumerate(mask):
+                if np.any(slice_ == self.foreground_label):
+                    self._slices.append({
+                        "path_to_cts": self.path_to_cts,
+                        "path_to_masks": self.path_to_masks,
+                        "path_to_output": self.path_to_output,
+                        "dataset_fname_relation": self.dataset_fname_relation,
+                        "mask_fname": path_to_mask.name,
+                        "ct_fname": ct_fname,
+                        "study": ct_fname.split(self._input_fname_extension)[0],
+                        "slice_idx": idx,
+                        "slice_rows": slice_.shape[0],
+                        "slice_cols": slice_.shape[1]
+                    })
+
     def _identify_slices(self):
         """Return a list with dictionaries of each slice containing
         2D connected components."""
@@ -126,32 +151,10 @@ class Evaluator:
             item
             for item in Path(self.path_to_masks).glob(f"*{self._input_fname_extension}")
         ]
-        slices = []
-        slices_count = 0
-        for path in tqdm(paths_to_masks):
-            mask = np.uint8(sitk.GetArrayFromImage(sitk.ReadImage(path)))
-            if np.any(mask == 1):
-                if self.dataset_fname_relation == 'nnunet':
-                    ct_fname = f"{path.name.split(self._input_fname_extension)[0]}_0000{self._input_fname_extension}"
-                else:
-                    ct_fname = path.name
-                for idx, slice_ in enumerate(mask):
-                    if np.any(slice_ == self.foreground_label):
-                        slices.append({
-                            "slice_id": slices_count,
-                            "path_to_cts": self.path_to_cts,
-                            "path_to_masks": self.path_to_masks,
-                            "path_to_output": self.path_to_output,
-                            "dataset_fname_relation": self.dataset_fname_relation,
-                            "mask_fname": path.name,
-                            "ct_fname": ct_fname,
-                            "study": ct_fname.split(self._input_fname_extension)[0],
-                            "slice_idx": idx,
-                            "slice_rows": slice_.shape[0],
-                            "slice_cols": slice_.shape[1]
-                        })
-                        slices_count += 1
-        return slices
+        self._slices = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+            executor.map(self._identify_slices_in_mask, paths_to_masks)
+        return self._slices
 
     def _preprocess_ct(self, ct):
         """Preprocess slices from a CT volume according to the MedSAM
