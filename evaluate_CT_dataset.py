@@ -98,7 +98,8 @@ class Evaluator:
     def __init__(self, path_to_cts, path_to_masks, path_to_output,
                  device='cuda:0', num_workers=4, batch_size=8, threads=8,
                  dataset_fname_relation='same_name', foreground_label=1,
-                 min_bbox_annotated_pixels=1, bbox_scale_factor=1.0) -> None:
+                 min_bbox_annotated_pixels=1, bbox_scale_factor=1.0,
+                 save_overlapped=True) -> None:
         self.path_to_cts = path_to_cts
         self.path_to_masks = path_to_masks
         self.path_to_output = path_to_output
@@ -110,6 +111,7 @@ class Evaluator:
         self.threads = threads
         self.min_bbox_annotated_pixels = min_bbox_annotated_pixels
         self.bbox_scale_factor = bbox_scale_factor
+        self.save_overlapped = save_overlapped
         self._input_fname_extension = '.nii.gz'
         self._original_suffix = "original_size"
         self._preprocessed_suffix = "preprocessed"
@@ -370,7 +372,6 @@ class Evaluator:
         """Compute performance on a single bounding box."""
         print(f"bbox: {Path(bbox['path_to_bbox_original']).name}, processing ...")
         # read predicted mask in original size
-        path_to_output_overlapped = Path(self.path_to_output) / self._output_overlapped_suffix
         path_to_output_mask = (
             Path(self.path_to_output) /
             self._output_masks_suffix /
@@ -404,34 +405,37 @@ class Evaluator:
             check_contrast=False
         )
         # save plotting with overlapped output
-        img_3c = io.imread(
-            Path(bbox['path_to_output']) /
-            self._original_suffix /
-            f"{bbox['ct_fname'].split(self._input_fname_extension)[0]}_slice{bbox['slice_idx']}.png"
-        )
-        _, ax = plt.subplots(1, 3, figsize=(15, 5))
-        ax[0].imshow(img_3c)
-        show_box(bbox['bbox_original'].squeeze(), ax[0])
-        ax[0].set_title("Input Image and Bounding Box")
-        ax[1].imshow(img_3c)
-        show_mask(gt_mask, ax[1])
-        show_box(bbox['bbox_original'].squeeze(), ax[1])
-        ax[1].set_title("Ground truth")
-        ax[2].imshow(img_3c)
-        show_mask(medsam_seg, ax[2])
-        show_box(bbox['bbox_original'].squeeze(), ax[2])
-        ax[2].set_title(f"MedSAM Segmentation (Dice={round(dice_score, 3)})")
-        plt.tight_layout()
-        plt.savefig(path_to_output_overlapped / bbox_fname_png)
-        plt.close()
+        if self.save_overlapped:
+            path_to_output_overlapped = Path(self.path_to_output) / self._output_overlapped_suffix
+            img_3c = io.imread(
+                Path(bbox['path_to_output']) /
+                self._original_suffix /
+                f"{bbox['ct_fname'].split(self._input_fname_extension)[0]}_slice{bbox['slice_idx']}.png"
+            )
+            _, ax = plt.subplots(1, 3, figsize=(15, 5))
+            ax[0].imshow(img_3c)
+            show_box(bbox['bbox_original'].squeeze(), ax[0])
+            ax[0].set_title("Input Image and Bounding Box")
+            ax[1].imshow(img_3c)
+            show_mask(gt_mask, ax[1])
+            show_box(bbox['bbox_original'].squeeze(), ax[1])
+            ax[1].set_title("Ground truth")
+            ax[2].imshow(img_3c)
+            show_mask(medsam_seg, ax[2])
+            show_box(bbox['bbox_original'].squeeze(), ax[2])
+            ax[2].set_title(f"MedSAM Segmentation (Dice={round(dice_score, 3)})")
+            plt.tight_layout()
+            plt.savefig(path_to_output_overlapped / bbox_fname_png)
+            plt.close()
 
     def _compute_performance(self, bboxes):
         """Compute performance from predicted masks."""
         print("Computing performance ...")
         path_to_gt_masks = Path(self.path_to_output) / self._gt_masks_suffix
-        path_to_output_overlapped = Path(self.path_to_output) / self._output_overlapped_suffix
         path_to_gt_masks.mkdir(exist_ok=True)
-        path_to_output_overlapped.mkdir(exist_ok=True)
+        if self.save_overlapped:
+            path_to_output_overlapped = Path(self.path_to_output) / self._output_overlapped_suffix
+            path_to_output_overlapped.mkdir(exist_ok=True)
         self._performance = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
             executor.map(self._compute_single_performance, bboxes)
@@ -575,6 +579,12 @@ if __name__ == "__main__":
         bounding boxes computed from the connected components
         in the annotated masks."""
     )
+    parser.add_argument(
+        '--dont_save_overlapped',
+        action='store_true',
+        help="""Add this flag to avoid saving output images
+        with masks and boxes overlapped in the image."""
+    )
     args = parser.parse_args()
     window = windows.get(args.window, None)
     evaluator = Evaluator(
@@ -587,7 +597,8 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         batch_size=args.batch_size,
         min_bbox_annotated_pixels=args.min_annotated_pixels,
-        bbox_scale_factor=args.bbox_scale_factor
+        bbox_scale_factor=args.bbox_scale_factor,
+        save_overlapped = not args.dont_save_overlapped
     )
     start_time = time.time()
     results = evaluator.run_evaluation(
