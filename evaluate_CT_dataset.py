@@ -97,7 +97,8 @@ class Evaluator:
     """Run evaluation of MedSAM model on CT dataset."""
     def __init__(self, path_to_cts, path_to_masks, path_to_output,
                  device='cuda:0', num_workers=4, batch_size=8, threads=8,
-                 dataset_fname_relation='same_name', foreground_label=1) -> None:
+                 dataset_fname_relation='same_name', foreground_label=1,
+                 min_bbox_annotated_pixels=1) -> None:
         self.path_to_cts = path_to_cts
         self.path_to_masks = path_to_masks
         self.path_to_output = path_to_output
@@ -107,6 +108,7 @@ class Evaluator:
         self.num_workers = num_workers
         self.batch_size = batch_size
         self.threads = threads
+        self.min_bbox_annotated_pixels = min_bbox_annotated_pixels
         self._input_fname_extension = '.nii.gz'
         self._original_suffix = "original_size"
         self._preprocessed_suffix = "preprocessed"
@@ -254,6 +256,7 @@ class Evaluator:
                 "object_coords": object['coords']
             }
             for object in props
+            if object['num_pixels'] >= self.min_bbox_annotated_pixels
         ]
         for bbox in bboxes_slice:
             path_to_bbox_original = (
@@ -540,6 +543,13 @@ if __name__ == "__main__":
         default=2,
         help="Batch size for inference using GPU."
     )
+    parser.add_argument(
+        '--min_annotated_pixels',
+        type=int,
+        default=1,
+        help="""Minimun size of connected components. Bounding boxes
+        with smaller objects are excluded."""
+    )
     args = parser.parse_args()
     window = windows.get(args.window, None)
     evaluator = Evaluator(
@@ -550,7 +560,8 @@ if __name__ == "__main__":
         foreground_label=args.foreground_label,
         threads=args.threads,
         num_workers=args.num_workers,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        min_bbox_annotated_pixels=args.min_annotated_pixels
     )
     start_time = time.time()
     results = evaluator.run_evaluation(
