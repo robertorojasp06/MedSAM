@@ -98,7 +98,7 @@ class Evaluator:
     def __init__(self, path_to_cts, path_to_masks, path_to_output,
                  device='cuda:0', num_workers=4, batch_size=8, threads=8,
                  dataset_fname_relation='same_name', foreground_label=1,
-                 min_bbox_annotated_pixels=1) -> None:
+                 min_bbox_annotated_pixels=1, bbox_scale_factor=1.0) -> None:
         self.path_to_cts = path_to_cts
         self.path_to_masks = path_to_masks
         self.path_to_output = path_to_output
@@ -109,6 +109,7 @@ class Evaluator:
         self.batch_size = batch_size
         self.threads = threads
         self.min_bbox_annotated_pixels = min_bbox_annotated_pixels
+        self.bbox_scale_factor = bbox_scale_factor
         self._input_fname_extension = '.nii.gz'
         self._original_suffix = "original_size"
         self._preprocessed_suffix = "preprocessed"
@@ -237,6 +238,22 @@ class Evaluator:
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
             executor.map(self._preprocess_ct, cts)
 
+    def _scale_bounding_box(self, bbox_array):
+        """Return a scaled version of the input bounding box given
+        as a numpy array [min_col, min_row, max_col, max_row]."""
+        bbox_array = bbox_array.squeeze()
+        center_col = (bbox_array[0] + bbox_array[2]) / 2.0
+        center_row = (bbox_array[1] + bbox_array[3]) / 2.0
+        width = bbox_array[2] - bbox_array[0]
+        height = bbox_array[3] - bbox_array[1]
+        new_width = width * self.bbox_scale_factor
+        new_height = height * self.bbox_scale_factor
+        new_min_col = center_col - new_width / 2.0
+        new_min_row = center_row - new_height / 2.0
+        new_max_col = center_col + new_width / 2.0
+        new_max_row = center_row + new_height / 2.0
+        return np.array([[new_min_col, new_min_row, new_max_col, new_max_row]])
+
     def _compute_bounding_box_slice(self, slice_):
         """Compute bounding boxes for a single slice."""
         print(f"study: {slice_['study']}, slice: {slice_['slice_idx']}, processing ...")
@@ -251,8 +268,8 @@ class Evaluator:
         bboxes_slice = [
             {
                 **slice_,
-                "bbox_original": np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]]),
-                "bbox_1024": np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]]) / np.array([W, H, W, H]) * 1024,
+                "bbox_original": self._scale_bounding_box(np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]])),
+                "bbox_1024": self._scale_bounding_box(np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]])) / np.array([W, H, W, H]) * 1024,
                 "object_coords": object['coords']
             }
             for object in props
@@ -263,7 +280,7 @@ class Evaluator:
                 Path(self.path_to_output) /
                 self._bbox_original_suffix /
                 bbox['study'] /
-                f"{bbox['study']}_sliceidx{slice_['slice_idx']}_{bbox['bbox_original'].squeeze()[0]}_{bbox['bbox_original'].squeeze()[1]}_{bbox['bbox_original'].squeeze()[2]}_{bbox['bbox_original'].squeeze()[3]}.npy"
+                f"{bbox['study']}_sliceidx{slice_['slice_idx']}_{int(bbox['bbox_original'].squeeze()[0])}_{int(bbox['bbox_original'].squeeze()[1])}_{int(bbox['bbox_original'].squeeze()[2])}_{int(bbox['bbox_original'].squeeze()[3])}.npy"
             )
             path_to_bbox1024 = (
                 Path(self.path_to_output) /
@@ -550,6 +567,14 @@ if __name__ == "__main__":
         help="""Minimun size of connected components. Bounding boxes
         with smaller objects are excluded."""
     )
+    parser.add_argument(
+        '--bbox_scale_factor',
+        type=float,
+        default=1.0,
+        help="""Factor to scale the size (in both dimensions) of
+        bounding boxes computed from the connected components
+        in the annotated masks."""
+    )
     args = parser.parse_args()
     window = windows.get(args.window, None)
     evaluator = Evaluator(
@@ -561,7 +586,8 @@ if __name__ == "__main__":
         threads=args.threads,
         num_workers=args.num_workers,
         batch_size=args.batch_size,
-        min_bbox_annotated_pixels=args.min_annotated_pixels
+        min_bbox_annotated_pixels=args.min_annotated_pixels,
+        bbox_scale_factor=args.bbox_scale_factor
     )
     start_time = time.time()
     results = evaluator.run_evaluation(
