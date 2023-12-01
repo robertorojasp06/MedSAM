@@ -174,4 +174,5 @@ cython_debug/
 #.idea/
 
 results/
+notebooks/2/resources/*.json
 notebooks/3/resources/*.json
