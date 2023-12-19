@@ -94,12 +94,13 @@ class Evaluator:
     """Run evaluation of MedSAM model on elongated 2D objects
     from Gatidis dataset annotated by HCUCH radiologists."""
     def __init__(self, path_to_studies, path_to_objects, path_to_output,
-                 window=None, device='cuda:0', num_workers=4,
-                 batch_size=8, threads=8, bbox_scale_factor=1.0,
-                 save_overlapped=True) -> None:
+                 path_to_checkpoint, window=None, device='cuda:0',
+                 num_workers=4, batch_size=8, threads=8,
+                 bbox_scale_factor=1.0, save_overlapped=True) -> None:
         self.path_to_studies = path_to_studies
         self.path_to_objects = path_to_objects
         self.path_to_output = path_to_output
+        self.path_to_checkpoint = path_to_checkpoint
         self.window = window
         self.device = device
         self.num_workers = num_workers
@@ -108,7 +109,6 @@ class Evaluator:
         self.bbox_scale_factor = bbox_scale_factor
         self.save_overlapped = save_overlapped
         self._ct_filename = 'imaging.nii.gz'
-        self._input_fname_extension = '.nii.gz'
         self._original_suffix = "original_size"
         self._preprocessed_suffix = "preprocessed"
         self._embeddings_suffix = "embedding"
@@ -296,7 +296,7 @@ class Evaluator:
             executor.map(self._save_bounding_box, bboxes)
 
     @torch.no_grad()
-    def _run_inference(self, bbox_dataset, path_to_checkpoint):
+    def _run_inference(self, bbox_dataset):
         """Run inference on bounding boxes."""
         print("Running inference ...")
         dataloader = DataLoader(
@@ -304,7 +304,7 @@ class Evaluator:
             self.batch_size,
             num_workers=self.num_workers
         )
-        medsam_model = sam_model_registry["vit_b"](checkpoint=path_to_checkpoint)
+        medsam_model = sam_model_registry["vit_b"](checkpoint=self.path_to_checkpoint)
         medsam_model = medsam_model.to(self.device)
         medsam_model.eval()
         for index, slice_1024, bbox_1024, slice_rows, slice_cols, annotator in tqdm(dataloader):
@@ -395,7 +395,7 @@ class Evaluator:
         # save plotting with overlapped output
         if self.save_overlapped:
             img_3c = io.imread(bbox["path_to_original_slice"])
-            _, ax = plt.subplots(1, 3, figsize=(15, 5))
+            _, ax = plt.subplots(1, 3, figsize=(22.5, 7.5))
             ax[0].imshow(img_3c)
             show_box(bbox['bbox_original'].squeeze(), ax[0])
             ax[0].set_title("Input Image and Bounding Box")
@@ -422,7 +422,7 @@ class Evaluator:
             executor.map(self._compute_performance, self._bboxes)
         return self._performance
 
-    def run_evaluation(self, path_to_checkpoint):
+    def run_evaluation(self):
         """Run MedSAM inference on bounding boxes and measure the
         Dice coefficient."""
         assert torch.cuda.is_available(), "You need GPU and CUDA to make the evaluation."
@@ -450,7 +450,7 @@ class Evaluator:
             for item in self._bboxes
         ]
         bbox_dataset = BBoxDataset(bbox_mapping, self.device)
-        self._run_inference(bbox_dataset, path_to_checkpoint)
+        self._run_inference(bbox_dataset)
         performance = self._compute_performance_concurrently()
         results = {
             "bboxes": self._bboxes,
@@ -461,157 +461,120 @@ class Evaluator:
 
 if __name__ == "__main__":
     mp.set_start_method('spawn')
-    path_to_studies = "/home/robber/Downloads/annotations-on-PETCT/nifti"
-    path_to_objects = "/media/robber/Nuevo vol/FONDEF_ID23I10337/petct-local-annotations/notebooks/1/resources/elongated-objects/elongated_objects.pkl"
-    path_to_output = "/media/robber/Nuevo vol/MedSAM/results/petct-hcuch-elongated-objects"
-    path_to_checkpoint = "/media/robber/Nuevo vol/MedSAM/work_dir/MedSAM/medsam_vit_b.pth"
-    window = {"L": 40, "W": 350}
-    evaluator = Evaluator(
-        path_to_studies,
-        path_to_objects,
-        path_to_output,
-        window=window,
-        batch_size=2
+    windows = {
+        "lung": {"L": -500, "W": 1400},
+        "abdomen": {"L": 40, "W": 350},
+        "bone": {"L": 400, "W": 1000},
+        "air": {"L": -426, "W": 1000},
+        "brain": {"L": 50, "W": 100}
+    }
+    parser = argparse.ArgumentParser(
+        description="""Evaluate MedSAM on elongated 2d objects annotated
+        by HCUCH radiologists on Gatidis dataset.""",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    evaluator.run_evaluation(path_to_checkpoint)
-
-# if __name__ == "__main__":
-#     mp.set_start_method('spawn')
-#     windows = {
-#         "lung": {"L": -500, "W": 1400},
-#         "abdomen": {"L": 40, "W": 350},
-#         "bone": {"L": 400, "W": 1000},
-#         "air": {"L": -426, "W": 1000},
-#         "brain": {"L": 50, "W": 100}
-#     }
-#     parser = argparse.ArgumentParser(
-#         description="""Evaluate MedSAM on a CT dataset with annotated
-#         masks.""",
-#         formatter_class=argparse.ArgumentDefaultsHelpFormatter
-#     )
-#     parser.add_argument(
-#         'path_to_cts',
-#         type=str,
-#         help="""Path to the directory with CT studies in NIfTI format
-#         (.nii.gz)."""
-#     )
-#     parser.add_argument(
-#         'path_to_masks',
-#         type=str,
-#         help="""Path to the directory with corresponding masks in NIfTI
-#         format (.nii.gz)."""
-#     )
-#     parser.add_argument(
-#         'path_to_output',
-#         type=str,
-#         help="Path to the directory to save output results."
-#     )
-#     parser.add_argument(
-#         '--path_to_checkpoint',
-#         type=str,
-#         default="work_dir/MedSAM/medsam_vit_b.pth",
-#         help="Path to the checkpoint model."
-#     )
-#     parser.add_argument(
-#         '--window',
-#         choices=list(windows.keys()),
-#         default=None,
-#         help="""Window for CT normalization. If None, values are clipped
-#         to percentiles 0.5 and 99.5, and then mapped to the range 0-255."""
-#     )
-#     parser.add_argument(
-#         '--dataset_fname_relation',
-#         choices=['nnunet', 'same_name'],
-#         default='same_name',
-#         help="""Relation between CT studies and masks filenames.
-#         'nnunet' means nnUNet pipeline filenames format, and 'same_name'
-#          means CT and mask NIfTI volumes have the same filename."""
-#     )
-#     parser.add_argument(
-#         '--foreground_label',
-#         type=int,
-#         default=1,
-#         help="""Integer label corresponding to the foreground class in
-#         the annotated masks."""
-#     )
-#     parser.add_argument(
-#         '--threads',
-#         type=int,
-#         default=8,
-#         help="Maximum number of concurrent threads for CPU tasks."
-#     )
-#     parser.add_argument(
-#         '--num_workers',
-#         type=int,
-#         default=4,
-#         help="Max workers for GPU processing."
-#     )
-#     parser.add_argument(
-#         '--batch_size',
-#         type=int,
-#         default=2,
-#         help="Batch size for inference using GPU."
-#     )
-#     parser.add_argument(
-#         '--min_annotated_pixels',
-#         type=int,
-#         default=1,
-#         help="""Minimun size of connected components. Bounding boxes
-#         with smaller objects are excluded."""
-#     )
-#     parser.add_argument(
-#         '--bbox_scale_factor',
-#         type=float,
-#         default=1.0,
-#         help="""Factor to scale the size (in both dimensions) of
-#         bounding boxes computed from the connected components
-#         in the annotated masks."""
-#     )
-#     parser.add_argument(
-#         '--dont_save_overlapped',
-#         action='store_true',
-#         help="""Add this flag to avoid saving output images
-#         with masks and boxes overlapped in the image."""
-#     )
-#     args = parser.parse_args()
-#     window = windows.get(args.window, None)
-#     evaluator = Evaluator(
-#         path_to_cts=args.path_to_cts,
-#         path_to_masks=args.path_to_masks,
-#         path_to_output=args.path_to_output,
-#         dataset_fname_relation=args.dataset_fname_relation,
-#         foreground_label=args.foreground_label,
-#         threads=args.threads,
-#         num_workers=args.num_workers,
-#         batch_size=args.batch_size,
-#         min_bbox_annotated_pixels=args.min_annotated_pixels,
-#         bbox_scale_factor=args.bbox_scale_factor,
-#         save_overlapped = not args.dont_save_overlapped
-#     )
-#     start_time = time.time()
-#     results = evaluator.run_evaluation(
-#         args.path_to_checkpoint,
-#         window
-#     )
-#     end_time = time.time()
-#     execution_time = end_time - start_time
-#     hours = int(execution_time // 3600)
-#     minutes = int((execution_time % 3600) // 60)
-#     seconds = int(execution_time % 60)
-#     formatted_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-#     print(f"execution time (HH:MM:SS): {formatted_time}")
-#     with open(Path(args.path_to_output) / 'slices.pkl', 'wb') as file:
-#         pickle.dump(results["slices"], file)
-#     with open(Path(args.path_to_output) / 'bboxes.pkl', 'wb') as file:
-#         pickle.dump(results["bboxes"], file)
-#     with open(Path(args.path_to_output) / 'performance.json', 'w') as file:
-#         json.dump(
-#             {
-#                 "bboxes": results["performance"],
-#                 "execution time (HH:MM:SS)": formatted_time
-#             },
-#             file,
-#             indent=4
-#         )
-#     with open(Path(args.path_to_output) / 'arguments.json', 'w') as file:
-#         json.dump({**vars(args), "window_L_W": window}, file, indent=4)
+    parser.add_argument(
+        'path_to_studies',
+        type=str,
+        help="""Path to the directory with the CT studies in NIfTI format
+        (.nii.gz). Expected format: annotators -> studies -> imaging.nii.gz"""
+    )
+    parser.add_argument(
+        'path_to_objects',
+        type=str,
+        help="""Path to the pickle file containing the 2d objects as
+        a dictionary. Expected format: 'annotators': {'studies': [objects]}."""
+    )
+    parser.add_argument(
+        'path_to_output',
+        type=str,
+        help="Path to the directory to save output results."
+    )
+    parser.add_argument(
+        '--path_to_checkpoint',
+        type=str,
+        default="work_dir/MedSAM/medsam_vit_b.pth",
+        help="Path to the checkpoint model."
+    )
+    parser.add_argument(
+        '--window',
+        choices=list(windows.keys()),
+        default=None,
+        help="""Window for CT normalization. If None, values are clipped
+        to percentiles 0.5 and 99.5, and then mapped to the range 0-255."""
+    )
+    parser.add_argument(
+        '--threads',
+        type=int,
+        default=8,
+        help="Maximum number of concurrent threads for CPU tasks."
+    )
+    parser.add_argument(
+        '--num_workers',
+        type=int,
+        default=4,
+        help="Max workers for GPU processing."
+    )
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=2,
+        help="Batch size for inference using GPU."
+    )
+    parser.add_argument(
+        '--bbox_scale_factor',
+        type=float,
+        default=1.0,
+        help="""Factor to scale the size (in both dimensions) of
+        bounding boxes computed from the connected components
+        in the annotated masks."""
+    )
+    parser.add_argument(
+        '--dont_save_overlapped',
+        action='store_true',
+        help="""Add this flag to avoid saving output images
+        with masks and boxes overlapped in the image."""
+    )
+    args = parser.parse_args()
+    window = windows.get(args.window, None)
+    evaluator = Evaluator(
+        path_to_studies=args.path_to_studies,
+        path_to_objects=args.path_to_objects,
+        path_to_output=args.path_to_output,
+        path_to_checkpoint=args.path_to_checkpoint,
+        threads=args.threads,
+        num_workers=args.num_workers,
+        batch_size=args.batch_size,
+        bbox_scale_factor=args.bbox_scale_factor,
+        save_overlapped = not args.dont_save_overlapped,
+        window=window
+    )
+    start_time = time.time()
+    results = evaluator.run_evaluation()
+    end_time = time.time()
+    execution_time = end_time - start_time
+    hours = int(execution_time // 3600)
+    minutes = int((execution_time % 3600) // 60)
+    seconds = int(execution_time % 60)
+    formatted_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    print(f"execution time (HH:MM:SS): {formatted_time}")
+    with open(Path(args.path_to_output) / 'bboxes.pkl', 'wb') as file:
+        pickle.dump(results["bboxes"], file)
+    json_format_performance = [
+        {
+            key: int(value) if isinstance(value, np.int64) else value
+            for key, value in object_.items()
+        }
+        for object_ in results["performance"]
+    ]
+    with open(Path(args.path_to_output) / 'performance.json', 'w') as file:
+        json.dump(
+            {
+                "bboxes": json_format_performance,
+                "execution time (HH:MM:SS)": formatted_time
+            },
+            file,
+            indent=4
+        )
+    with open(Path(args.path_to_output) / 'arguments.json', 'w') as file:
+        json.dump({**vars(args), "window_L_W": window}, file, indent=4)
