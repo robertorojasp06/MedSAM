@@ -98,12 +98,13 @@ class Evaluator:
     def __init__(self, path_to_cts, path_to_masks, path_to_output,
                  device='cuda:0', num_workers=4, batch_size=8, threads=8,
                  dataset_fname_relation='same_name', foreground_label=1,
-                 min_bbox_annotated_pixels=1, bbox_scale_factor=1.0,
-                 save_overlapped=True) -> None:
+                 to_exclude=None, min_bbox_annotated_pixels=1,
+                 bbox_scale_factor=1.0, save_overlapped=True) -> None:
         self.path_to_cts = path_to_cts
         self.path_to_masks = path_to_masks
         self.path_to_output = path_to_output
         self.foreground_label = foreground_label
+        self.to_exclude = to_exclude
         self.dataset_fname_relation = dataset_fname_relation
         self.device = device
         self.num_workers = num_workers
@@ -128,13 +129,34 @@ class Evaluator:
         path_to_mask = Path(path_to_mask)
         print(f"mask: {path_to_mask.name}, processing ...")
         mask = np.uint8(sitk.GetArrayFromImage(sitk.ReadImage(path_to_mask)))
-        if np.any(mask == 1):
+        if self.foreground_label == -1:
+            foreground_labels = np.unique(mask)
+            foreground_labels = [
+                label
+                for label in foreground_labels
+                if label > 0
+            ]
+        else:
+            foreground_labels = [self.foreground_label]
+        labels_to_exclude = self.to_exclude.get(path_to_mask.name, None)
+        if labels_to_exclude:
+            labels_to_exclude =[
+                int(label)
+                for label in labels_to_exclude
+            ]
+            foreground_labels = [
+                label
+                for label in foreground_labels
+                if label not in labels_to_exclude
+            ]
+        mask_binary = np.isin(mask, foreground_labels)
+        if np.any(mask_binary):
             if self.dataset_fname_relation == 'nnunet':
                 ct_fname = f"{path_to_mask.name.split(self._input_fname_extension)[0]}_0000{self._input_fname_extension}"
             else:
                 ct_fname = path_to_mask.name
-            for idx, slice_ in enumerate(mask):
-                if np.any(slice_ == self.foreground_label):
+            for idx, (slice_, mask_slice) in enumerate(zip(mask_binary, mask)):
+                if np.any(slice_):
                     self._slices.append({
                         "path_to_cts": self.path_to_cts,
                         "path_to_masks": self.path_to_masks,
@@ -145,8 +167,10 @@ class Evaluator:
                         "study": ct_fname.split(self._input_fname_extension)[0],
                         "slice_idx": idx,
                         "slice_rows": slice_.shape[0],
-                        "slice_cols": slice_.shape[1]
+                        "slice_cols": slice_.shape[1],
+                        "foreground_labels": list(np.unique(mask_slice))
                     })
+                    print(slice_)
 
     def _identify_slices(self):
         """Return a list with dictionaries of each slice containing
@@ -168,6 +192,7 @@ class Evaluator:
         ct_slice_inds = ct["ct_slice_inds"]
         window = ct["window"]
         if not ct_slice_inds:
+            print("Im here")
             return
         print(f"ct_fname: {ct_fname}, annotated slices: {len(ct_slice_inds)}, processing ...")
         ct_array = sitk.GetArrayFromImage(sitk.ReadImage(Path(self.path_to_cts) / ct_fname))
@@ -259,48 +284,50 @@ class Evaluator:
     def _compute_bounding_box_slice(self, slice_):
         """Compute bounding boxes for a single slice."""
         print(f"study: {slice_['study']}, slice: {slice_['slice_idx']}, processing ...")
+        H, W = slice_['slice_rows'], slice_['slice_cols']
         path_to_mask= (
             Path(slice_['path_to_masks']) /
             slice_['mask_fname']
         )
         mask = sitk.GetArrayFromImage(sitk.ReadImage(path_to_mask))[slice_['slice_idx']]
-        labeled = label(mask == self.foreground_label)
-        props = regionprops(labeled)
-        H, W = slice_['slice_rows'], slice_['slice_cols']
-        bboxes_slice = [
-            {
-                **slice_,
-                "bbox_original": self._scale_bounding_box(np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]])),
-                "bbox_1024": self._scale_bounding_box(np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]])) / np.array([W, H, W, H]) * 1024,
-                "object_coords": object['coords']
-            }
-            for object in props
-            if object['num_pixels'] >= self.min_bbox_annotated_pixels
-        ]
-        for bbox in bboxes_slice:
-            path_to_bbox_original = (
-                Path(self.path_to_output) /
-                self._bbox_original_suffix /
-                bbox['study'] /
-                f"{bbox['study']}_sliceidx{slice_['slice_idx']}_{int(bbox['bbox_original'].squeeze()[0])}_{int(bbox['bbox_original'].squeeze()[1])}_{int(bbox['bbox_original'].squeeze()[2])}_{int(bbox['bbox_original'].squeeze()[3])}.npy"
-            )
-            path_to_bbox1024 = (
-                Path(self.path_to_output) /
-                self._bbox1024_suffix /
-                bbox['study'] /
-                f"{bbox['study']}_sliceidx{slice_['slice_idx']}_{int(bbox['bbox_1024'].squeeze()[0])}_{int(bbox['bbox_1024'].squeeze()[1])}_{int(bbox['bbox_1024'].squeeze()[2])}_{int(bbox['bbox_1024'].squeeze()[3])}.npy"
-            )
-            bbox.update({
-                "path_to_bbox_original": str(path_to_bbox_original),
-                "path_to_bbox_1024": str(path_to_bbox1024),
-                "path_to_preprocessed_slice": str(Path(self.path_to_output) / self._preprocessed_suffix / f"{bbox['study']}_slice{bbox['slice_idx']}.png")
-            })
-            for path, key in zip([path_to_bbox_original, path_to_bbox1024], ['bbox_original', 'bbox_1024']):
-                if not path.parent.exists():
-                    path.parent.mkdir(parents=True)
-                with open(path, 'wb') as file:
-                    np.save(file, bbox[key])
-        self._bboxes += bboxes_slice
+        for foreground_label in slice_['foreground_labels']:
+            labeled = label(mask == foreground_label)
+            props = regionprops(labeled)
+            bboxes_slice = [
+                {
+                    **slice_,
+                    "foreground_label": foreground_label,
+                    "bbox_original": self._scale_bounding_box(np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]])),
+                    "bbox_1024": self._scale_bounding_box(np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]])) / np.array([W, H, W, H]) * 1024,
+                    "object_coords": object['coords']
+                }
+                for object in props
+                if object['num_pixels'] >= self.min_bbox_annotated_pixels
+            ]
+            for bbox in bboxes_slice:
+                path_to_bbox_original = (
+                    Path(self.path_to_output) /
+                    self._bbox_original_suffix /
+                    bbox['study'] /
+                    f"{bbox['study']}_sliceidx{slice_['slice_idx']}_foregroundlabel{foreground_label}_{int(bbox['bbox_original'].squeeze()[0])}_{int(bbox['bbox_original'].squeeze()[1])}_{int(bbox['bbox_original'].squeeze()[2])}_{int(bbox['bbox_original'].squeeze()[3])}.npy"
+                )
+                path_to_bbox1024 = (
+                    Path(self.path_to_output) /
+                    self._bbox1024_suffix /
+                    bbox['study'] /
+                    f"{bbox['study']}_sliceidx{slice_['slice_idx']}_foregroundlabel{foreground_label}_{int(bbox['bbox_1024'].squeeze()[0])}_{int(bbox['bbox_1024'].squeeze()[1])}_{int(bbox['bbox_1024'].squeeze()[2])}_{int(bbox['bbox_1024'].squeeze()[3])}.npy"
+                )
+                bbox.update({
+                    "path_to_bbox_original": str(path_to_bbox_original),
+                    "path_to_bbox_1024": str(path_to_bbox1024),
+                    "path_to_preprocessed_slice": str(Path(self.path_to_output) / self._preprocessed_suffix / f"{bbox['study']}_slice{bbox['slice_idx']}.png")
+                })
+                for path, key in zip([path_to_bbox_original, path_to_bbox1024], ['bbox_original', 'bbox_1024']):
+                    if not path.parent.exists():
+                        path.parent.mkdir(parents=True)
+                    with open(path, 'wb') as file:
+                        np.save(file, bbox[key])
+            self._bboxes += bboxes_slice
 
     def _compute_bounding_boxes(self, slices):
         """Return a list of dictionaries for each bounding box
@@ -386,7 +413,12 @@ class Evaluator:
         performance = {
             key: value
             for key, value in bbox.items()
-            if key not in ('bbox_original', 'bbox_1024', 'object_coords')
+            if key not in (
+                'bbox_original',
+                'bbox_1024',
+                'object_coords',
+                'foreground_labels'
+            )
         }
         performance.update({
             "bbox_original_fname": bbox_fname,
@@ -544,7 +576,15 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="""Integer label corresponding to the foreground class in
-        the annotated masks."""
+        the annotated masks. If set to -1, all positive integers
+        will be considered."""
+    )
+    parser.add_argument(
+        '--to_exclude',
+        type=str,
+        default=None,
+        help="""Path to the JSON file with the foreground labels to be
+        excluded for each study in the format: {'mask_filename': [1, 2, ...]}."""
     )
     parser.add_argument(
         '--threads',
@@ -587,12 +627,16 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     window = windows.get(args.window, None)
+    if args.to_exclude:
+        with open(args.to_exclude, 'r') as file:
+            to_exclude = json.load(file)
     evaluator = Evaluator(
         path_to_cts=args.path_to_cts,
         path_to_masks=args.path_to_masks,
         path_to_output=args.path_to_output,
         dataset_fname_relation=args.dataset_fname_relation,
         foreground_label=args.foreground_label,
+        to_exclude=to_exclude,
         threads=args.threads,
         num_workers=args.num_workers,
         batch_size=args.batch_size,
