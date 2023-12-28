@@ -157,6 +157,11 @@ class Evaluator:
                 ct_fname = path_to_mask.name
             for idx, (slice_, mask_slice) in enumerate(zip(mask_binary, mask)):
                 if np.any(slice_):
+                    slice_labels = [
+                        label
+                        for label in np.unique(mask_slice)
+                        if label in foreground_labels
+                    ]
                     self._slices.append({
                         "path_to_cts": self.path_to_cts,
                         "path_to_masks": self.path_to_masks,
@@ -168,9 +173,8 @@ class Evaluator:
                         "slice_idx": idx,
                         "slice_rows": slice_.shape[0],
                         "slice_cols": slice_.shape[1],
-                        "foreground_labels": list(np.unique(mask_slice))
+                        "foreground_labels": slice_labels
                     })
-                    print(slice_)
 
     def _identify_slices(self):
         """Return a list with dictionaries of each slice containing
@@ -192,7 +196,6 @@ class Evaluator:
         ct_slice_inds = ct["ct_slice_inds"]
         window = ct["window"]
         if not ct_slice_inds:
-            print("Im here")
             return
         print(f"ct_fname: {ct_fname}, annotated slices: {len(ct_slice_inds)}, processing ...")
         ct_array = sitk.GetArrayFromImage(sitk.ReadImage(Path(self.path_to_cts) / ct_fname))
@@ -660,10 +663,18 @@ if __name__ == "__main__":
         pickle.dump(results["slices"], file)
     with open(Path(args.path_to_output) / 'bboxes.pkl', 'wb') as file:
         pickle.dump(results["bboxes"], file)
+    json_format_performance = [
+        {
+            key: int(value)
+            if isinstance(value, (np.int64, np.uint8)) else value
+            for key, value in object_.items()
+        }
+        for object_ in results["performance"]
+    ]
     with open(Path(args.path_to_output) / 'performance.json', 'w') as file:
         json.dump(
             {
-                "bboxes": results["performance"],
+                "bboxes": json_format_performance,
                 "execution time (HH:MM:SS)": formatted_time
             },
             file,
