@@ -633,6 +633,8 @@ if __name__ == "__main__":
     if args.to_exclude:
         with open(args.to_exclude, 'r') as file:
             to_exclude = json.load(file)
+    else:
+        to_exclude = {}
     evaluator = Evaluator(
         path_to_cts=args.path_to_cts,
         path_to_masks=args.path_to_masks,
