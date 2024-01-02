@@ -178,3 +178,4 @@ evaluate_CT_dataset.sh
 notebooks/2/resources/*.json
 notebooks/3/resources/*.json
 notebooks/4/resources
+notebooks/5/resources
