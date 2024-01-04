@@ -138,9 +138,12 @@ class Evaluator:
             ]
         else:
             foreground_labels = [self.foreground_label]
-        labels_to_exclude = self.to_exclude.get(path_to_mask.name, None)
+        if self.to_exclude:
+            labels_to_exclude = self.to_exclude.get(path_to_mask.name, None)
+        else:
+            labels_to_exclude = None
         if labels_to_exclude:
-            labels_to_exclude =[
+            labels_to_exclude = [
                 int(label)
                 for label in labels_to_exclude
             ]
@@ -634,7 +637,7 @@ if __name__ == "__main__":
         with open(args.to_exclude, 'r') as file:
             to_exclude = json.load(file)
     else:
-        to_exclude = {}
+        to_exclude = None
     evaluator = Evaluator(
         path_to_cts=args.path_to_cts,
         path_to_masks=args.path_to_masks,
