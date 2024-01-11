@@ -99,6 +99,7 @@ def run_inference(ct_array, rois, path_to_checkpoint, path_to_output,
     medsam_model = sam_model_registry["vit_b"](checkpoint=path_to_checkpoint)
     medsam_model = medsam_model.to(device)
     medsam_model.eval()
+    ct_mask = np.zeros(ct_array.shape).astype(np.uint8)
     for roi_counter, roi in enumerate(tqdm(rois), start=1):
         for slice_idx in tqdm(range(min(roi["slices"]), max(roi["slices"]) + 1), leave=False):
             # preprocess slice
@@ -158,6 +159,10 @@ def run_inference(ct_array, rois, path_to_checkpoint, path_to_output,
             plt.tight_layout()
             plt.savefig(path_to_output_original)
             plt.close()
+            # add output mask to ct mask
+            foreground_coords = np.where(medsam_seg == 1)
+            ct_mask[slice_idx][foreground_coords] = roi_counter
+    return ct_mask
 
 
 if __name__ == "__main__":
@@ -215,16 +220,25 @@ if __name__ == "__main__":
         device = torch.device('cpu')
     else:
         device = torch.device('cuda:0')
-    ct_array = sitk.GetArrayFromImage(sitk.ReadImage(args.path_to_ct))
+    ct_image = sitk.ReadImage(args.path_to_ct)
+    ct_array = sitk.GetArrayFromImage(ct_image)
     with open(args.path_to_rois, 'r') as file:
         rois = json.load(file)
     # normalize ct
     ct_array_pre = normalize_ct(ct_array, windows[args.window])
     # run inference
-    run_inference(
+    ct_mask = run_inference(
         ct_array_pre,
         rois,
         args.path_to_checkpoint,
         args.path_to_output,
         device
+    )
+    # save output ct mask
+    ct_mask = np.flip(ct_mask, axis=1)
+    ct_mask_image = sitk.GetImageFromArray(ct_mask)
+    ct_mask_image.CopyInformation(ct_image)
+    sitk.WriteImage(
+        ct_mask_image,
+        Path(args.path_to_output) / f"{Path(args.path_to_ct).name.split('.nii.gz')[0]} mask.nii.gz"
     )
