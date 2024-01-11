@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import json
+import pickle
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
@@ -100,7 +101,9 @@ def run_inference(ct_array, rois, path_to_checkpoint, path_to_output,
     medsam_model = medsam_model.to(device)
     medsam_model.eval()
     ct_mask = np.zeros(ct_array.shape).astype(np.uint8)
+    output_rois = []
     for roi_counter, roi in enumerate(tqdm(rois), start=1):
+        roi_foreground_tuples = []
         for slice_idx in tqdm(range(min(roi["slices"]), max(roi["slices"]) + 1), leave=False):
             # preprocess slice
             slice_npy = np.flip(ct_array[slice_idx, :, :], axis=0)
@@ -162,7 +165,15 @@ def run_inference(ct_array, rois, path_to_checkpoint, path_to_output,
             # add output mask to ct mask
             foreground_coords = np.where(medsam_seg == 1)
             ct_mask[slice_idx][foreground_coords] = roi_counter
-    return ct_mask
+            # add foreground (slice, row, column)-coordinates (npy origin, zero based)
+            foreground_tuples = [
+                (slice_idx, row, col)
+                for row, col in zip(*foreground_coords)
+            ]
+            roi_foreground_tuples += foreground_tuples
+        roi.update({"foreground_coordinates_npy": roi_foreground_tuples})
+        output_rois.append(roi)
+    return ct_mask, output_rois
 
 
 if __name__ == "__main__":
@@ -227,7 +238,7 @@ if __name__ == "__main__":
     # normalize ct
     ct_array_pre = normalize_ct(ct_array, windows[args.window])
     # run inference
-    ct_mask = run_inference(
+    ct_mask, output_rois = run_inference(
         ct_array_pre,
         rois,
         args.path_to_checkpoint,
@@ -242,3 +253,6 @@ if __name__ == "__main__":
         ct_mask_image,
         Path(args.path_to_output) / f"{Path(args.path_to_ct).name.split('.nii.gz')[0]} mask.nii.gz"
     )
+    # save output rois
+    with open(Path(args.path_to_output) / f"{Path(args.path_to_ct).name.split('.nii.gz')[0]} output rois.pkl", 'wb') as file:
+        pickle.dump(output_rois, file)
