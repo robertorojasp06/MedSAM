@@ -51,8 +51,6 @@ def normalize_ct(ct_array, window=None, epsilon = 1e-6):
     return np.uint8(ct_array_pre)
 
 
-
-
 def main(path_to_root, path_to_output, windows_mapping,
 		 save_plots=False):
 	path_to_imgs = Path(path_to_root) / 'imgs'
@@ -122,8 +120,8 @@ def main(path_to_root, path_to_output, windows_mapping,
 				anti_aliasing=True
 			))
 			name = path_to_img.name.replace('.nii.gz', '')
-			name2save_img = Path(path_to_output_imgs) / f'{slice_idx}_{name}_img.npy'
-			name2save_seg = Path(path_to_output_gts) / f'{slice_idx}_{name}_seg.npy'
+			name2save_img = Path(path_to_output_imgs) / f'{slice_idx}_{name}.npy'
+			name2save_seg = Path(path_to_output_gts) / f'{slice_idx}_{name}.npy'
 			np.save(name2save_img, ct_slice_1024_3c)
 			np.save(name2save_seg, mask_slice_1024)
 
