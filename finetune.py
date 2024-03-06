@@ -1,10 +1,7 @@
-# -*- coding: utf-8 -*-
 """
 train the image encoder and mask decoder
 freeze prompt image encoder
 """
-
-# %% setup environment
 import numpy as np
 import matplotlib.pyplot as plt
 import os
@@ -81,6 +78,9 @@ class NpyDataset(Dataset):
         img_1024 = np.load(
             join(self.img_path, img_name), "r", allow_pickle=True
         )  # (1024, 1024, 3)
+        if np.max(img_1024) > 1.0:
+            img_1024 = img_1024/np.max(img_1024)
+
         # convert the shape to (3, H, W)
         img_1024 = np.transpose(img_1024, (2, 0, 1))
         assert (
@@ -113,96 +113,6 @@ class NpyDataset(Dataset):
             torch.tensor(bboxes).float(),
             img_name,
         )
-
-
-# %% sanity test of dataset class
-tr_dataset = NpyDataset("/home/covasquez/MedSAM-finetuning/npy_dataset")
-tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
-for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):
-    print(image.shape, gt.shape, bboxes.shape)
-    # show the example
-    _, axs = plt.subplots(1, 2, figsize=(25, 25))
-    idx = random.randint(0, 7)
-    axs[0].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
-    show_mask(gt[idx].cpu().numpy(), axs[0])
-    show_box(bboxes[idx].numpy(), axs[0])
-    axs[0].axis("off")
-    # set title
-    axs[0].set_title(names_temp[idx])
-    idx = random.randint(0, 7)
-    axs[1].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
-    show_mask(gt[idx].cpu().numpy(), axs[1])
-    show_box(bboxes[idx].numpy(), axs[1])
-    axs[1].axis("off")
-    # set title
-    axs[1].set_title(names_temp[idx])
-    # plt.show()
-    plt.subplots_adjust(wspace=0.01, hspace=0)
-    plt.savefig("./data_sanitycheck.png", bbox_inches="tight", dpi=300)
-    plt.close()
-    break
-
-# %% set up parser
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "-i",
-    "--tr_npy_path",
-    type=str,
-    default="data/npy/CT_Abd",
-    help="path to training npy files; two subfolders: gts and imgs",
-)
-parser.add_argument("-task_name", type=str, default="MedSAM-ViT-B")
-parser.add_argument("-model_type", type=str, default="vit_b")
-parser.add_argument(
-    "-checkpoint", type=str, default="work_dir/SAM/sam_vit_b_01ec64.pth"
-)
-# parser.add_argument('-device', type=str, default='cuda:0')
-parser.add_argument(
-    "--load_pretrain", type=bool, default=True, help="use wandb to monitor training"
-)
-parser.add_argument("-pretrain_model_path", type=str, default="")
-parser.add_argument("-work_dir", type=str, default="./work_dir")
-# train
-parser.add_argument("-num_epochs", type=int, default=1000)
-parser.add_argument("-batch_size", type=int, default=2)
-parser.add_argument("-num_workers", type=int, default=0)
-# Optimizer parameters
-parser.add_argument(
-    "-weight_decay", type=float, default=0.01, help="weight decay (default: 0.01)"
-)
-parser.add_argument(
-    "-lr", type=float, default=0.0001, metavar="LR", help="learning rate (absolute lr)"
-)
-parser.add_argument(
-    "-use_wandb", type=bool, default=False, help="use wandb to monitor training"
-)
-parser.add_argument("-use_amp", action="store_true", default=False, help="use amp")
-parser.add_argument(
-    "--resume", type=str, default="", help="Resuming training from checkpoint"
-)
-parser.add_argument("--device", type=str, default="cuda:0")
-args = parser.parse_args()
-
-if args.use_wandb:
-    import wandb
-
-    wandb.login()
-    wandb.init(
-        project=args.task_name,
-        config={
-            "lr": args.lr,
-            "batch_size": args.batch_size,
-            "data_path": args.tr_npy_path,
-            "model_type": args.model_type,
-        },
-    )
-
-# %% set up model for training
-# device = args.device
-run_id = datetime.now().strftime("%Y%m%d-%H%M")
-model_save_path = join(args.work_dir, args.task_name + "-" + run_id)
-device = torch.device(args.device)
-# %% set up model
 
 
 class MedSAM(nn.Module):
@@ -250,6 +160,89 @@ class MedSAM(nn.Module):
 
 
 def main():
+    # Setup parser
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-i",
+        "--tr_npy_path",
+        type=str,
+        default="data/npy/CT_Abd",
+        help="path to training npy files; two subfolders: gts and imgs",
+    )
+    parser.add_argument("-task_name", type=str, default="MedSAM-ViT-B")
+    parser.add_argument("-model_type", type=str, default="vit_b")
+    parser.add_argument(
+        "-checkpoint", type=str, default="work_dir/SAM/sam_vit_b_01ec64.pth"
+    )
+    # parser.add_argument('-device', type=str, default='cuda:0')
+    parser.add_argument(
+        "--load_pretrain", type=bool, default=True, help="use wandb to monitor training"
+    )
+    parser.add_argument("-pretrain_model_path", type=str, default="")
+    parser.add_argument("-work_dir", type=str, default="./work_dir")
+    parser.add_argument("-num_epochs", type=int, default=1000)
+    parser.add_argument("-batch_size", type=int, default=2)
+    parser.add_argument("-num_workers", type=int, default=0)
+    parser.add_argument(
+        "-weight_decay", type=float, default=0.01, help="weight decay (default: 0.01)"
+    )
+    parser.add_argument(
+        "-lr", type=float, default=0.0001, metavar="LR", help="learning rate (absolute lr)"
+    )
+    parser.add_argument(
+        "-use_wandb", type=bool, default=False, help="use wandb to monitor training"
+    )
+    parser.add_argument("-use_amp", action="store_true", default=False, help="use amp")
+    parser.add_argument(
+        "--resume", type=str, default="", help="Resuming training from checkpoint"
+    )
+    parser.add_argument("--device", type=str, default="cuda:0")
+    args = parser.parse_args()
+
+    if args.use_wandb:
+        import wandb
+
+        wandb.login()
+        wandb.init(
+            project=args.task_name,
+            config={
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "data_path": args.tr_npy_path,
+                "model_type": args.model_type,
+            },
+        )
+    # Sanity check of dataset
+    tr_dataset = NpyDataset("/home/covasquez/MedSAM-finetuning/processed_npy")
+    tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
+    for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):
+        print(image.shape, gt.shape, bboxes.shape)
+        # show the example
+        _, axs = plt.subplots(1, 2, figsize=(25, 25))
+        idx = random.randint(0, 7)
+        axs[0].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
+        show_mask(gt[idx].cpu().numpy(), axs[0])
+        show_box(bboxes[idx].numpy(), axs[0])
+        axs[0].axis("off")
+        # set title
+        axs[0].set_title(names_temp[idx])
+        idx = random.randint(0, 7)
+        axs[1].imshow(image[idx].cpu().permute(1, 2, 0).numpy())
+        show_mask(gt[idx].cpu().numpy(), axs[1])
+        show_box(bboxes[idx].numpy(), axs[1])
+        axs[1].axis("off")
+        # set title
+        axs[1].set_title(names_temp[idx])
+        # plt.show()
+        plt.subplots_adjust(wspace=0.01, hspace=0)
+        plt.savefig("./data_sanitycheck.png", bbox_inches="tight", dpi=300)
+        plt.close()
+        break
+    # Set up model
+    run_id = datetime.now().strftime("%Y%m%d-%H%M")
+    model_save_path = join(args.work_dir, args.task_name + "-" + run_id)
+    device = torch.device(args.device)
+
     os.makedirs(model_save_path, exist_ok=True)
     shutil.copyfile(
         __file__, join(model_save_path, run_id + "_" + os.path.basename(__file__))
@@ -268,7 +261,7 @@ def main():
     seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
     # cross entropy loss
     ce_loss = nn.BCEWithLogitsLoss(reduction="mean")
-    # %% train
+    # train
     num_epochs = args.num_epochs
     iter_num = 0
     losses = []
