@@ -216,3 +216,5 @@ if __name__ == "__main__":
 		windows_mapping,
 		args.sanity_check
 	)
+	with open(Path(args.path_to_output) / 'arguments.json', 'w') as file:
+		json.dump(vars(args), file, indent=4)
