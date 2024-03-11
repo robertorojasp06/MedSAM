@@ -15,7 +15,6 @@ import torch.multiprocessing as mp
 import time
 from pathlib import Path
 from skimage import io, transform
-from skimage.measure import label, regionprops
 from segment_anything import sam_model_registry
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
@@ -52,10 +51,7 @@ def dice_coefficient(reference, prediction, are_binary=False):
 
 
 class BBoxDataset(Dataset):
-    def __init__(self, path_to_slices, path_to_bboxes_1024,
-                 bbox_mapping, device) -> None:
-        self.path_to_slices = path_to_slices
-        self.path_to_bboxes_1024 = path_to_bboxes_1024
+    def __init__(self, bbox_mapping, device) -> None:
         self.bbox_mapping = bbox_mapping
         self.device = device
 
@@ -71,8 +67,8 @@ class BBoxDataset(Dataset):
         return len(self.bbox_mapping)
 
     def __getitem__(self, index):
-        path_to_slice = Path(self.path_to_slices) / self.bbox_mapping.loc[index, "preprocessed_slice"]
-        path_to_bbox_1024 = Path(self.path_to_bboxes_1024) / self.bbox_mapping.loc[index, "study"] / self.bbox_mapping.loc[index, "bbox_1024"]
+        path_to_slice = self.bbox_mapping.loc[index, "preprocessed_slice"]
+        path_to_bbox_1024 = self.bbox_mapping.loc[index, "bbox_1024"]
         slice_1024 = io.imread(path_to_slice)
         with open(path_to_bbox_1024, 'rb') as file:
             bbox_1024 = np.load(file)
@@ -90,30 +86,29 @@ class BBoxDataset(Dataset):
                 slice_1024_tensor,
                 bbox_1024_tensor,
                 self.bbox_mapping.at[index, "slice_rows"],
-                self.bbox_mapping.at[index, "slice_cols"])
+                self.bbox_mapping.at[index, "slice_cols"],
+                self.bbox_mapping.at[index, "annotator"])
 
 
 class Evaluator:
-    """Run evaluation of MedSAM model on CT dataset."""
-    def __init__(self, path_to_cts, path_to_masks, path_to_output,
-                 device='cuda:0', num_workers=4, batch_size=8, threads=8,
-                 dataset_fname_relation='same_name', foreground_label=1,
-                 to_exclude=None, min_bbox_annotated_pixels=1,
+    """Run evaluation of MedSAM model on elongated 2D objects
+    from Gatidis dataset annotated by HCUCH radiologists."""
+    def __init__(self, path_to_studies, path_to_objects, path_to_output,
+                 path_to_checkpoint, window=None, device='cuda:0',
+                 num_workers=4, batch_size=8, threads=8,
                  bbox_scale_factor=1.0, save_overlapped=True) -> None:
-        self.path_to_cts = path_to_cts
-        self.path_to_masks = path_to_masks
+        self.path_to_studies = path_to_studies
+        self.path_to_objects = path_to_objects
         self.path_to_output = path_to_output
-        self.foreground_label = foreground_label
-        self.to_exclude = to_exclude
-        self.dataset_fname_relation = dataset_fname_relation
+        self.path_to_checkpoint = path_to_checkpoint
+        self.window = window
         self.device = device
         self.num_workers = num_workers
         self.batch_size = batch_size
         self.threads = threads
-        self.min_bbox_annotated_pixels = min_bbox_annotated_pixels
         self.bbox_scale_factor = bbox_scale_factor
         self.save_overlapped = save_overlapped
-        self._input_fname_extension = '.nii.gz'
+        self._ct_filename = 'imaging.nii.gz'
         self._original_suffix = "original_size"
         self._preprocessed_suffix = "preprocessed"
         self._embeddings_suffix = "embedding"
@@ -124,92 +119,34 @@ class Evaluator:
         self._output_overlapped_suffix = "output_overlapped"
         self._epsilon = 1e-6
 
-    def _identify_slices_in_mask(self, path_to_mask):
-        """Identify annotated slices in the specified mask."""
-        path_to_mask = Path(path_to_mask)
-        print(f"mask: {path_to_mask.name}, processing ...")
-        mask = np.uint8(sitk.GetArrayFromImage(sitk.ReadImage(path_to_mask)))
-        if self.foreground_label == -1:
-            foreground_labels = np.unique(mask)
-            foreground_labels = [
-                label
-                for label in foreground_labels
-                if label > 0
-            ]
-        else:
-            foreground_labels = [self.foreground_label]
-        if self.to_exclude:
-            labels_to_exclude = self.to_exclude.get(path_to_mask.name, None)
-        else:
-            labels_to_exclude = None
-        if labels_to_exclude:
-            labels_to_exclude = [
-                int(label)
-                for label in labels_to_exclude
-            ]
-            foreground_labels = [
-                label
-                for label in foreground_labels
-                if label not in labels_to_exclude
-            ]
-        mask_binary = np.isin(mask, foreground_labels)
-        if np.any(mask_binary):
-            if self.dataset_fname_relation == 'nnunet':
-                ct_fname = f"{path_to_mask.name.split(self._input_fname_extension)[0]}_0000{self._input_fname_extension}"
-            else:
-                ct_fname = path_to_mask.name
-            for idx, (slice_, mask_slice) in enumerate(zip(mask_binary, mask)):
-                if np.any(slice_):
-                    slice_labels = [
-                        label
-                        for label in np.unique(mask_slice)
-                        if label in foreground_labels
-                    ]
-                    self._slices.append({
-                        "path_to_cts": self.path_to_cts,
-                        "path_to_masks": self.path_to_masks,
-                        "path_to_output": self.path_to_output,
-                        "dataset_fname_relation": self.dataset_fname_relation,
-                        "mask_fname": path_to_mask.name,
-                        "ct_fname": ct_fname,
-                        "study": ct_fname.split(self._input_fname_extension)[0],
-                        "slice_idx": idx,
-                        "slice_rows": slice_.shape[0],
-                        "slice_cols": slice_.shape[1],
-                        "foreground_labels": slice_labels
-                    })
+    @property
+    def window(self):
+        return self._window
 
-    def _identify_slices(self):
-        """Return a list with dictionaries of each slice containing
-        2D connected components."""
-        print("Identifying annotated slices ...")
-        paths_to_masks = [
-            item
-            for item in Path(self.path_to_masks).glob(f"*{self._input_fname_extension}")
-        ]
-        self._slices = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            executor.map(self._identify_slices_in_mask, paths_to_masks)
-        return self._slices
+    @window.setter
+    def window(self, value):
+        if value is not None:
+            assert "L" in value.keys() and "W" in value.keys()
+        self._window = value
 
     def _preprocess_ct(self, ct):
-        """Preprocess slices from a CT volume according to the MedSAM
-        pipeline."""
-        ct_fname = ct["ct_fname"]
+        """Apply window normalization to a CT volume and resize specified
+        slices according to the MedSAM pipeline."""
+        ct_annotator = ct["annotator"]
+        ct_study = ct["study"]
         ct_slice_inds = ct["ct_slice_inds"]
-        window = ct["window"]
         if not ct_slice_inds:
             return
-        print(f"ct_fname: {ct_fname}, annotated slices: {len(ct_slice_inds)}, processing ...")
-        ct_array = sitk.GetArrayFromImage(sitk.ReadImage(Path(self.path_to_cts) / ct_fname))
-        path_to_out_preprocessed = Path(self.path_to_output) / self._preprocessed_suffix
-        path_to_original_size = Path(self.path_to_output) / self._original_suffix
-        path_to_out_preprocessed.mkdir(exist_ok=True)
-        path_to_original_size.mkdir(exist_ok=True)
+        print(f"study: {ct_study}, annotator: {ct_annotator}, annotated slices: {len(ct_slice_inds)}, processing ...")
+        ct_array = sitk.GetArrayFromImage(sitk.ReadImage(Path(self.path_to_studies) / ct_annotator / ct_study / self._ct_filename))
+        path_to_preprocessed = Path(self.path_to_output) / ct_annotator / self._preprocessed_suffix
+        path_to_original_size = Path(self.path_to_output) / ct_annotator / self._original_suffix
+        path_to_preprocessed.mkdir(exist_ok=True, parents=True)
+        path_to_original_size.mkdir(exist_ok=True, parents=True)
         # CT normalization
-        if window:
-            lower_bound = window["L"] - window["W"] / 2
-            upper_bound = window["L"] + window["W"] / 2
+        if self.window:
+            lower_bound = self.window["L"] - self.window["W"] / 2
+            upper_bound = self.window["L"] + self.window["W"] / 2
             ct_array_pre = np.clip(ct_array, lower_bound, upper_bound)
             ct_array_pre = (
                 (ct_array_pre - np.min(ct_array_pre) + self._epsilon)
@@ -241,34 +178,35 @@ class Evaluator:
                 anti_aliasing=True
             ).astype(np.uint8)
             io.imsave(
-                path_to_out_preprocessed / f"{ct_fname.split(self._input_fname_extension)[0]}_slice{slice_idx}.png",
+                path_to_preprocessed / f"{ct_study}_slice{slice_idx}.png",
                 slice_1024,
                 check_contrast=False
             )
             io.imsave(
-                path_to_original_size / f"{ct_fname.split(self._input_fname_extension)[0]}_slice{slice_idx}.png",
+                path_to_original_size / f"{ct_study}_slice{slice_idx}.png",
                 slice_3c.astype(np.uint8),
                 check_contrast=False
             )
 
-    def _preprocess_slices(self, slices, window):
-        """Preprocess the input set of slices according to the
-        MedSAM pipeline."""
-        print("Preprocessing CTs and slices ...")
-        unique_cts = [item["ct_fname"] for item in slices]
-        unique_cts = list(set(unique_cts))
-        ct_to_slices = {item: [] for item in unique_cts}
-        for slice_ in slices:
-            ct_to_slices[slice_["ct_fname"]].append(slice_)
+    def _preprocess_cts_concurrently(self):
+        print("Preprocessing CTs ...")
+        with open(self.path_to_objects, 'rb') as file:
+            objects = pickle.load(file)
         cts = []
-        for ct_fname, ct_slices in ct_to_slices.items():
-            ct = {
-                "ct_fname": ct_fname,
-                "ct_slice_inds": [item["slice_idx"] for item in ct_slices],
-                "window": window
-            }
-            cts.append(ct)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+        for annotator in objects.keys():
+            for study in objects[annotator]:
+                slice_inds = [
+                    object_['slice_idx']
+                    for object_ in objects[annotator][study]
+                ]
+                cts += [
+                    {
+                        "study": study,
+                        "annotator": annotator,
+                        "ct_slice_inds": list(set(slice_inds))
+                    }
+                ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             executor.map(self._preprocess_ct, cts)
 
     def _scale_bounding_box(self, bbox_array):
@@ -287,78 +225,89 @@ class Evaluator:
         new_max_row = center_row + new_height / 2.0
         return np.array([[new_min_col, new_min_row, new_max_col, new_max_row]])
 
-    def _compute_bounding_box_slice(self, slice_):
-        """Compute bounding boxes for a single slice."""
-        print(f"study: {slice_['study']}, slice: {slice_['slice_idx']}, processing ...")
-        H, W = slice_['slice_rows'], slice_['slice_cols']
-        path_to_mask= (
-            Path(slice_['path_to_masks']) /
-            slice_['mask_fname']
+    def _save_bounding_box(self, bbox):
+        """Save bounding box (original and resized to 1024x1024) as a
+        numpy array and append it to self._bboxes."""
+        annotator = bbox['annotator']
+        study = bbox['study']
+        slice_idx = bbox['slice_idx']
+        object_id = bbox['object_id']
+        bbox_array = np.array([[
+            bbox['bbox'][1],
+            bbox['bbox'][0],
+            bbox['bbox'][3],
+            bbox['bbox'][2]
+        ]])
+        print(f"study: {study}, slice: {slice_idx}, object_id: {object_id}, processing ...")
+        H, W = sitk.GetArrayFromImage(sitk.ReadImage(
+            Path(self.path_to_studies) /
+            annotator /
+            study /
+            self._ct_filename
+        ))[slice_idx].shape
+        bbox_array_original = self._scale_bounding_box(bbox_array)
+        bbox_array_1024 = self._scale_bounding_box(bbox_array / np.array([W, H, W, H]) * 1024)
+        path_to_bbox_original = (
+            Path(self.path_to_output) /
+            annotator /
+            self._bbox_original_suffix /
+            bbox['study'] /
+            f"{study}_slice{slice_idx}_{int(bbox_array_original.squeeze()[0])}_{int(bbox_array_original.squeeze()[1])}_{int(bbox_array_original.squeeze()[2])}_{int(bbox_array_original.squeeze()[3])}.npy"
         )
-        mask = sitk.GetArrayFromImage(sitk.ReadImage(path_to_mask))[slice_['slice_idx']]
-        for foreground_label in slice_['foreground_labels']:
-            labeled = label(mask == foreground_label)
-            props = regionprops(labeled)
-            bboxes_slice = [
-                {
-                    **slice_,
-                    "foreground_label": foreground_label,
-                    "bbox_original": self._scale_bounding_box(np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]])),
-                    "bbox_1024": self._scale_bounding_box(np.array([[object['bbox'][1], object['bbox'][0], object['bbox'][3], object['bbox'][2]]])) / np.array([W, H, W, H]) * 1024,
-                    "object_coords": object['coords']
-                }
-                for object in props
-                if object['num_pixels'] >= self.min_bbox_annotated_pixels
-            ]
-            for bbox in bboxes_slice:
-                path_to_bbox_original = (
-                    Path(self.path_to_output) /
-                    self._bbox_original_suffix /
-                    bbox['study'] /
-                    f"{bbox['study']}_sliceidx{slice_['slice_idx']}_foregroundlabel{foreground_label}_{int(bbox['bbox_original'].squeeze()[0])}_{int(bbox['bbox_original'].squeeze()[1])}_{int(bbox['bbox_original'].squeeze()[2])}_{int(bbox['bbox_original'].squeeze()[3])}.npy"
-                )
-                path_to_bbox1024 = (
-                    Path(self.path_to_output) /
-                    self._bbox1024_suffix /
-                    bbox['study'] /
-                    f"{bbox['study']}_sliceidx{slice_['slice_idx']}_foregroundlabel{foreground_label}_{int(bbox['bbox_1024'].squeeze()[0])}_{int(bbox['bbox_1024'].squeeze()[1])}_{int(bbox['bbox_1024'].squeeze()[2])}_{int(bbox['bbox_1024'].squeeze()[3])}.npy"
-                )
-                bbox.update({
-                    "path_to_bbox_original": str(path_to_bbox_original),
-                    "path_to_bbox_1024": str(path_to_bbox1024),
-                    "path_to_preprocessed_slice": str(Path(self.path_to_output) / self._preprocessed_suffix / f"{bbox['study']}_slice{bbox['slice_idx']}.png")
-                })
-                for path, key in zip([path_to_bbox_original, path_to_bbox1024], ['bbox_original', 'bbox_1024']):
-                    if not path.parent.exists():
-                        path.parent.mkdir(parents=True)
-                    with open(path, 'wb') as file:
-                        np.save(file, bbox[key])
-            self._bboxes += bboxes_slice
+        path_to_bbox_1024 = (
+            Path(self.path_to_output) /
+            annotator /
+            self._bbox1024_suffix /
+            bbox['study'] /
+            f"{study}_slice{slice_idx}_{int(bbox_array_1024.squeeze()[0])}_{int(bbox_array_1024.squeeze()[1])}_{int(bbox_array_1024.squeeze()[2])}_{int(bbox_array_1024.squeeze()[3])}.npy"
+        )
+        bbox.update({
+            "path_to_bbox_original": str(path_to_bbox_original),
+            "path_to_bbox_1024": str(path_to_bbox_1024),
+            "path_to_original_slice": str(Path(self.path_to_output) / annotator / self._original_suffix / f"{study}_slice{slice_idx}.png"),
+            "path_to_preprocessed_slice": str(Path(self.path_to_output) / annotator / self._preprocessed_suffix / f"{study}_slice{slice_idx}.png"),
+            "slice_rows": H,
+            "slice_cols": W,
+            "bbox_original": bbox_array_original,
+            "bbox_1024": bbox_array_1024
+        })
+        for path, key in zip([path_to_bbox_original, path_to_bbox_1024], ['bbox_original', 'bbox_1024']):
+            if not path.parent.exists():
+                path.parent.mkdir(parents=True)
+            with open(path, 'wb') as file:
+                np.save(file, bbox[key])
+        self._bboxes.append(bbox)
 
-    def _compute_bounding_boxes(self, slices):
-        """Return a list of dictionaries for each bounding box
-        [min_col, min_row, max_col, max_row]."""
-        print("Computing bounding boxes ...")
+    def _save_bounding_boxes_concurrently(self):
+        print("Saving bounding boxes ...")
+        with open(self.path_to_objects, 'rb') as file:
+            objects = pickle.load(file)
+        bboxes = [
+            {
+                "annotator": annotator,
+                **object_
+            }
+            for annotator, studies in objects.items()
+            for objects in studies.values()
+            for object_ in objects
+        ]
         self._bboxes = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            executor.map(self._compute_bounding_box_slice, slices)
-        return self._bboxes
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            executor.map(self._save_bounding_box, bboxes)
 
     @torch.no_grad()
-    def _run_inference(self, bbox_dataset, path_to_checkpoint):
-        """Run inference on bboxes."""
+    def _run_inference(self, bbox_dataset):
+        """Run inference on bounding boxes."""
         print("Running inference ...")
-        path_to_output_masks = Path(self.path_to_output) / self._output_masks_suffix
-        path_to_output_masks.mkdir(exist_ok=True)
         dataloader = DataLoader(
             bbox_dataset,
             self.batch_size,
             num_workers=self.num_workers
         )
-        medsam_model = sam_model_registry["vit_b"](checkpoint=path_to_checkpoint)
+        medsam_model = sam_model_registry["vit_b"](checkpoint=self.path_to_checkpoint)
         medsam_model = medsam_model.to(self.device)
         medsam_model.eval()
-        for index, slice_1024, bbox_1024, slice_rows, slice_cols in tqdm(dataloader):
+        for index, slice_1024, bbox_1024, slice_rows, slice_cols, annotator in tqdm(dataloader):
             # Apply image encoder
             with torch.no_grad():
                 embedding_tensor = medsam_model.image_encoder(slice_1024)  # (1, 256, 64, 64)
@@ -380,8 +329,7 @@ class Evaluator:
             low_res_pred = torch.sigmoid(low_res_logits)  # (1, 1, 256, 256)
 
             # save individual output masks in original resolution
-            for low_res_sample, fname_idx, H, W in zip(low_res_pred, index, slice_rows, slice_cols):
-                # print("inside loop for individual interpolation and saving")
+            for low_res_sample, fname_idx, H, W, annotator_ in zip(low_res_pred, index, slice_rows, slice_cols, annotator):
                 low_res_sample = low_res_sample.unsqueeze(0)
                 fname_idx = fname_idx.item()
                 H = H.item()
@@ -394,37 +342,36 @@ class Evaluator:
                 )  # (1, 1, gt.shape)
                 low_res_sample = low_res_sample.squeeze().cpu().numpy()  # (256, 256)
                 medsam_seg = (low_res_sample > 0.5).astype(np.uint8)
-                bbox_fname_sample = bbox_dataset.bbox_mapping.loc[fname_idx, "bbox_original"]
+                bbox_fname_sample = Path(bbox_dataset.bbox_mapping.loc[fname_idx, "bbox_original"]).name
+                path_to_output_mask = Path(self.path_to_output) / annotator_ / self._output_masks_suffix / f"{bbox_fname_sample.split('.npy')[0]}.png"
+                if not path_to_output_mask.parent.exists():
+                    path_to_output_mask.parent.mkdir(parents=True)
                 io.imsave(
-                    path_to_output_masks / f"{bbox_fname_sample.split('.npy')[0]}.png",
+                    path_to_output_mask,
                     np.uint8(medsam_seg * 255.0),
                     check_contrast=False
                 )
 
-    def _compute_single_performance(self, bbox):
+    def _compute_performance(self, bbox):
         """Compute performance on a single bounding box."""
         print(f"bbox: {Path(bbox['path_to_bbox_original']).name}, processing ...")
         # read predicted mask in original size
         path_to_output_mask = (
             Path(self.path_to_output) /
+            bbox['annotator'] /
             self._output_masks_suffix /
             f"{Path(bbox['path_to_bbox_original']).name.split('.npy')[0]}.png"
         )
         medsam_seg = np.uint8(io.imread(path_to_output_mask).astype('bool'))
         # measure and save performance
         gt_mask = np.zeros((bbox['slice_rows'], bbox['slice_cols'])).astype(np.uint8)
-        gt_mask[bbox['object_coords'][:, 0], bbox['object_coords'][:, 1]] = 1
+        gt_mask[bbox['coordinates'][:, 0], bbox['coordinates'][:, 1]] = 1
         dice_score = dice_coefficient(gt_mask, medsam_seg, are_binary=False)
         bbox_fname = Path(bbox["path_to_bbox_original"]).name
         performance = {
             key: value
             for key, value in bbox.items()
-            if key not in (
-                'bbox_original',
-                'bbox_1024',
-                'object_coords',
-                'foreground_labels'
-            )
+            if key not in ('bbox_original', 'bbox_1024', 'coordinates')
         }
         performance.update({
             "bbox_original_fname": bbox_fname,
@@ -437,20 +384,18 @@ class Evaluator:
         self._performance.append(performance)
         # save gt
         bbox_fname_png = f"{bbox_fname.split('.npy')[0]}.png"
+        path_to_gt_mask = Path(self.path_to_output) / bbox['annotator'] / self._gt_masks_suffix / bbox_fname_png
+        if not path_to_gt_mask.parent.exists():
+            path_to_gt_mask.parent.mkdir(parents=True)
         io.imsave(
-            Path(self.path_to_output) / self._gt_masks_suffix / bbox_fname_png,
+            path_to_gt_mask,
             np.uint8(gt_mask * 255.0),
             check_contrast=False
         )
         # save plotting with overlapped output
         if self.save_overlapped:
-            path_to_output_overlapped = Path(self.path_to_output) / self._output_overlapped_suffix
-            img_3c = io.imread(
-                Path(bbox['path_to_output']) /
-                self._original_suffix /
-                f"{bbox['ct_fname'].split(self._input_fname_extension)[0]}_slice{bbox['slice_idx']}.png"
-            )
-            _, ax = plt.subplots(1, 3, figsize=(15, 5))
+            img_3c = io.imread(bbox["path_to_original_slice"])
+            _, ax = plt.subplots(1, 3, figsize=(22.5, 7.5))
             ax[0].imshow(img_3c)
             show_box(bbox['bbox_original'].squeeze(), ax[0])
             ax[0].set_title("Input Image and Bounding Box")
@@ -463,63 +408,52 @@ class Evaluator:
             show_box(bbox['bbox_original'].squeeze(), ax[2])
             ax[2].set_title(f"MedSAM Segmentation (Dice={round(dice_score, 3)})")
             plt.tight_layout()
-            plt.savefig(path_to_output_overlapped / bbox_fname_png)
+            path_to_output_overlapped = Path(self.path_to_output) / bbox["annotator"] / self._output_overlapped_suffix / bbox_fname_png
+            if not path_to_output_overlapped.parent.exists():
+                path_to_output_overlapped.parent.mkdir(parents=True)
+            plt.savefig(path_to_output_overlapped)
             plt.close()
 
-    def _compute_performance(self, bboxes):
+    def _compute_performance_concurrently(self):
         """Compute performance from predicted masks."""
         print("Computing performance ...")
-        path_to_gt_masks = Path(self.path_to_output) / self._gt_masks_suffix
-        path_to_gt_masks.mkdir(exist_ok=True)
-        if self.save_overlapped:
-            path_to_output_overlapped = Path(self.path_to_output) / self._output_overlapped_suffix
-            path_to_output_overlapped.mkdir(exist_ok=True)
         self._performance = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            executor.map(self._compute_single_performance, bboxes)
+            executor.map(self._compute_performance, self._bboxes)
         return self._performance
 
-    def run_evaluation(self, path_to_checkpoint, window=None):
+    def run_evaluation(self):
         """Run MedSAM inference on bounding boxes and measure the
         Dice coefficient."""
         assert torch.cuda.is_available(), "You need GPU and CUDA to make the evaluation."
-        slices = self._identify_slices()
-        self._preprocess_slices(slices, window)
-        bboxes = self._compute_bounding_boxes(slices)
+        self._preprocess_cts_concurrently()
+        self._save_bounding_boxes_concurrently()
         bbox_mapping = [
             {
+                "annotator": item["annotator"],
                 "study": item["study"],
                 "slice_idx": item["slice_idx"],
                 "slice_rows": item["slice_rows"],
                 "slice_cols": item["slice_cols"],
-                "bbox_1024": Path(item["path_to_bbox_1024"]).name,
+                "bbox_1024": item["path_to_bbox_1024"],
                 "row_min_1024": item["bbox_1024"].squeeze()[0],
                 "col_min_1024": item["bbox_1024"].squeeze()[1],
                 "row_max_1024": item["bbox_1024"].squeeze()[2],
                 "col_max_1024": item["bbox_1024"].squeeze()[3],
-                "preprocessed_slice": Path(item["path_to_preprocessed_slice"]).name,
-                "bbox_original": Path(item["path_to_bbox_original"]).name,
+                "preprocessed_slice": item["path_to_preprocessed_slice"],
+                "bbox_original": item["path_to_bbox_original"],
                 "row_min_original": item["bbox_original"].squeeze()[0],
                 "col_min_original": item["bbox_original"].squeeze()[1],
                 "row_max_original": item["bbox_original"].squeeze()[2],
                 "col_max_original": item["bbox_original"].squeeze()[3],
             }
-            for item in bboxes
+            for item in self._bboxes
         ]
-        bbox_dataset = BBoxDataset(
-            Path(self.path_to_output) / self._preprocessed_suffix,
-            Path(self.path_to_output) / self._bbox1024_suffix,
-            bbox_mapping,
-            self.device
-        )
-        self._run_inference(
-            bbox_dataset,
-            path_to_checkpoint
-        )
-        performance = self._compute_performance(bboxes)
+        bbox_dataset = BBoxDataset(bbox_mapping, self.device)
+        self._run_inference(bbox_dataset)
+        performance = self._compute_performance_concurrently()
         results = {
-            "slices": slices,
-            "bboxes": bboxes,
+            "bboxes": self._bboxes,
             "performance": performance
         }
         return results
@@ -535,21 +469,21 @@ if __name__ == "__main__":
         "brain": {"L": 50, "W": 100}
     }
     parser = argparse.ArgumentParser(
-        description="""Evaluate MedSAM on a CT dataset with annotated
-        masks.""",
+        description="""Evaluate MedSAM on elongated 2d objects annotated
+        by HCUCH radiologists on Gatidis dataset.""",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
-        'path_to_cts',
+        'path_to_studies',
         type=str,
-        help="""Path to the directory with CT studies in NIfTI format
-        (.nii.gz)."""
+        help="""Path to the directory with the CT studies in NIfTI format
+        (.nii.gz). Expected format: annotators -> studies -> imaging.nii.gz"""
     )
     parser.add_argument(
-        'path_to_masks',
+        'path_to_objects',
         type=str,
-        help="""Path to the directory with corresponding masks in NIfTI
-        format (.nii.gz)."""
+        help="""Path to the pickle file containing the 2d objects as
+        a dictionary. Expected format: 'annotators': {'studies': [objects]}."""
     )
     parser.add_argument(
         'path_to_output',
@@ -570,29 +504,6 @@ if __name__ == "__main__":
         to percentiles 0.5 and 99.5, and then mapped to the range 0-255."""
     )
     parser.add_argument(
-        '--dataset_fname_relation',
-        choices=['nnunet', 'same_name'],
-        default='same_name',
-        help="""Relation between CT studies and masks filenames.
-        'nnunet' means nnUNet pipeline filenames format, and 'same_name'
-         means CT and mask NIfTI volumes have the same filename."""
-    )
-    parser.add_argument(
-        '--foreground_label',
-        type=int,
-        default=1,
-        help="""Integer label corresponding to the foreground class in
-        the annotated masks. If set to -1, all positive integers
-        will be considered."""
-    )
-    parser.add_argument(
-        '--to_exclude',
-        type=str,
-        default=None,
-        help="""Path to the JSON file with the foreground labels to be
-        excluded for each study in the format: {'mask_filename': [1, 2, ...]}."""
-    )
-    parser.add_argument(
         '--threads',
         type=int,
         default=8,
@@ -611,13 +522,6 @@ if __name__ == "__main__":
         help="Batch size for inference using GPU."
     )
     parser.add_argument(
-        '--min_annotated_pixels',
-        type=int,
-        default=1,
-        help="""Minimun size of connected components. Bounding boxes
-        with smaller objects are excluded."""
-    )
-    parser.add_argument(
         '--bbox_scale_factor',
         type=float,
         default=1.0,
@@ -633,30 +537,20 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     window = windows.get(args.window, None)
-    if args.to_exclude:
-        with open(args.to_exclude, 'r') as file:
-            to_exclude = json.load(file)
-    else:
-        to_exclude = None
     evaluator = Evaluator(
-        path_to_cts=args.path_to_cts,
-        path_to_masks=args.path_to_masks,
+        path_to_studies=args.path_to_studies,
+        path_to_objects=args.path_to_objects,
         path_to_output=args.path_to_output,
-        dataset_fname_relation=args.dataset_fname_relation,
-        foreground_label=args.foreground_label,
-        to_exclude=to_exclude,
+        path_to_checkpoint=args.path_to_checkpoint,
         threads=args.threads,
         num_workers=args.num_workers,
         batch_size=args.batch_size,
-        min_bbox_annotated_pixels=args.min_annotated_pixels,
         bbox_scale_factor=args.bbox_scale_factor,
-        save_overlapped = not args.dont_save_overlapped
+        save_overlapped = not args.dont_save_overlapped,
+        window=window
     )
     start_time = time.time()
-    results = evaluator.run_evaluation(
-        args.path_to_checkpoint,
-        window
-    )
+    results = evaluator.run_evaluation()
     end_time = time.time()
     execution_time = end_time - start_time
     hours = int(execution_time // 3600)
@@ -664,14 +558,11 @@ if __name__ == "__main__":
     seconds = int(execution_time % 60)
     formatted_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     print(f"execution time (HH:MM:SS): {formatted_time}")
-    with open(Path(args.path_to_output) / 'slices.pkl', 'wb') as file:
-        pickle.dump(results["slices"], file)
     with open(Path(args.path_to_output) / 'bboxes.pkl', 'wb') as file:
         pickle.dump(results["bboxes"], file)
     json_format_performance = [
         {
-            key: int(value)
-            if isinstance(value, (np.int64, np.uint8)) else value
+            key: int(value) if isinstance(value, np.int64) else value
             for key, value in object_.items()
         }
         for object_ in results["performance"]
