@@ -174,3 +174,4 @@ cython_debug/
 #.idea/
 
 results/
+evaluate_CT_dataset.sh
