@@ -95,6 +95,14 @@ class BBoxDataset(Dataset):
 
 class Evaluator:
     """Run evaluation of MedSAM model on CT dataset."""
+    windows = {
+        "lung": {"L": -500, "W": 1400},
+        "abdomen": {"L": 40, "W": 350},
+        "bone": {"L": 400, "W": 1000},
+        "air": {"L": -426, "W": 1000},
+        "brain": {"L": 50, "W": 100}
+    }
+
     def __init__(self, path_to_cts, path_to_masks, path_to_output,
                  device='cuda:0', num_workers=4, batch_size=8, threads=8,
                  dataset_fname_relation='same_name', foreground_label=1,
@@ -197,7 +205,7 @@ class Evaluator:
         pipeline."""
         ct_fname = ct["ct_fname"]
         ct_slice_inds = ct["ct_slice_inds"]
-        window = ct["window"]
+        window = ct["window_values"]
         if not ct_slice_inds:
             return
         print(f"ct_fname: {ct_fname}, annotated slices: {len(ct_slice_inds)}, processing ...")
@@ -251,7 +259,7 @@ class Evaluator:
                 check_contrast=False
             )
 
-    def _preprocess_slices(self, slices, window):
+    def _preprocess_slices(self, slices, windows_mapping):
         """Preprocess the input set of slices according to the
         MedSAM pipeline."""
         print("Preprocessing CTs and slices ...")
@@ -265,7 +273,8 @@ class Evaluator:
             ct = {
                 "ct_fname": ct_fname,
                 "ct_slice_inds": [item["slice_idx"] for item in ct_slices],
-                "window": window
+                "window_name": windows_mapping.get(ct_fname, None),
+                "window_values": self.windows.get(windows_mapping.get(ct_fname, None))
             }
             cts.append(ct)
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
@@ -479,12 +488,12 @@ class Evaluator:
             executor.map(self._compute_single_performance, bboxes)
         return self._performance
 
-    def run_evaluation(self, path_to_checkpoint, window=None):
+    def run_evaluation(self, path_to_checkpoint, windows_mapping):
         """Run MedSAM inference on bounding boxes and measure the
         Dice coefficient."""
         assert torch.cuda.is_available(), "You need GPU and CUDA to make the evaluation."
         slices = self._identify_slices()
-        self._preprocess_slices(slices, window)
+        self._preprocess_slices(slices, windows_mapping)
         bboxes = self._compute_bounding_boxes(slices)
         bbox_mapping = [
             {
@@ -525,15 +534,39 @@ class Evaluator:
         return results
 
 
+def get_windows_mapping(window_arg, path_to_cts, windows):
+	if window_arg not in windows:
+		with open(window_arg, 'r') as file:
+			mapping = json.load(file)
+	else:
+		mapping = {
+			path.name: window_arg
+			for path in Path(path_to_cts).glob('*.nii.gz')
+		}
+	return mapping
+
+
+def check_windows_mapping(mapping, path_to_cts, windows):
+	# Check wrong windows
+	wrong_windows = [
+		f"filename '{filename}' with wrong window '{window}'."
+		for filename, window in mapping.items()
+		if window not in windows
+	]
+	if wrong_windows:
+		raise ValueError('\n'.join(wrong_windows))
+	# Check all CTs have their corresponding window
+	unassigned_cts = [
+		f"filename '{path.name}' does not have a window assigned."
+		for path in Path(path_to_cts).glob('*.nii.gz')
+		if path.name not in mapping.keys()
+	]
+	if unassigned_cts:
+		raise ValueError('\n'.join(unassigned_cts))
+
+
 if __name__ == "__main__":
     mp.set_start_method('spawn')
-    windows = {
-        "lung": {"L": -500, "W": 1400},
-        "abdomen": {"L": 40, "W": 350},
-        "bone": {"L": 400, "W": 1000},
-        "air": {"L": -426, "W": 1000},
-        "brain": {"L": 50, "W": 100}
-    }
     parser = argparse.ArgumentParser(
         description="""Evaluate MedSAM on a CT dataset with annotated
         masks.""",
@@ -564,10 +597,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--window',
-        choices=list(windows.keys()),
+        type=str,
         default=None,
-        help="""Window for CT normalization. If None, values are clipped
-        to percentiles 0.5 and 99.5, and then mapped to the range 0-255."""
+        help=f"""Window for CT normalization: {list(Evaluator.windows.keys())}. If
+        None, values are clipped to percentiles 0.5 and 99.5, and then mapped
+        to the range 0-255. This window is applied on all CTs. Alternatively,
+        you can provide the path to a JSON file with a dictionary containing
+        the mapping between filenames and windows."""
     )
     parser.add_argument(
         '--dataset_fname_relation',
@@ -632,7 +668,16 @@ if __name__ == "__main__":
         with masks and boxes overlapped in the image."""
     )
     args = parser.parse_args()
-    window = windows.get(args.window, None)
+    windows_mapping = get_windows_mapping(
+        args.window,
+        args.path_to_cts,
+        Evaluator.windows.keys()
+    )
+    check_windows_mapping(
+        windows_mapping,
+        args.path_to_cts,
+        Evaluator.windows.keys()
+    )
     if args.to_exclude:
         with open(args.to_exclude, 'r') as file:
             to_exclude = json.load(file)
@@ -655,7 +700,7 @@ if __name__ == "__main__":
     start_time = time.time()
     results = evaluator.run_evaluation(
         args.path_to_checkpoint,
-        window
+        windows_mapping
     )
     end_time = time.time()
     execution_time = end_time - start_time
@@ -686,4 +731,8 @@ if __name__ == "__main__":
             indent=4
         )
     with open(Path(args.path_to_output) / 'arguments.json', 'w') as file:
-        json.dump({**vars(args), "window_L_W": window}, file, indent=4)
+        json.dump(
+            {**vars(args), "windows": Evaluator.windows},
+            file,
+            indent=4
+        )

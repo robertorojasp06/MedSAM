@@ -1,14 +1,16 @@
+# -*- coding: utf-8 -*-
 """
 train the image encoder and mask decoder
 freeze prompt image encoder
 """
+
+# %% setup environment
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 
 join = os.path.join
 from tqdm import tqdm
-from skimage import transform
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -79,8 +81,7 @@ class NpyDataset(Dataset):
             join(self.img_path, img_name), "r", allow_pickle=True
         )  # (1024, 1024, 3)
         if np.max(img_1024) > 1.0:
-            img_1024 = img_1024/np.max(img_1024)
-
+            img_1024 = img_1024 / 255
         # convert the shape to (3, H, W)
         img_1024 = np.transpose(img_1024, (2, 0, 1))
         assert (
@@ -160,8 +161,12 @@ class MedSAM(nn.Module):
 
 
 def main():
-    # Setup parser
-    parser = argparse.ArgumentParser()
+    # %% set up parser
+    parser = argparse.ArgumentParser(
+        description="""Train the image encoder and mask decoder (freeze
+        prompt image encoder.""",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument(
         "-i",
         "--tr_npy_path",
@@ -180,9 +185,11 @@ def main():
     )
     parser.add_argument("-pretrain_model_path", type=str, default="")
     parser.add_argument("-work_dir", type=str, default="./work_dir")
+    # train
     parser.add_argument("-num_epochs", type=int, default=1000)
     parser.add_argument("-batch_size", type=int, default=2)
     parser.add_argument("-num_workers", type=int, default=0)
+    # Optimizer parameters
     parser.add_argument(
         "-weight_decay", type=float, default=0.01, help="weight decay (default: 0.01)"
     )
@@ -199,21 +206,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0")
     args = parser.parse_args()
 
-    if args.use_wandb:
-        import wandb
-
-        wandb.login()
-        wandb.init(
-            project=args.task_name,
-            config={
-                "lr": args.lr,
-                "batch_size": args.batch_size,
-                "data_path": args.tr_npy_path,
-                "model_type": args.model_type,
-            },
-        )
-    # Sanity check of dataset
-    tr_dataset = NpyDataset("/home/covasquez/MedSAM-finetuning/processed_npy")
+    # %% sanity test of dataset class
+    tr_dataset = NpyDataset(args.tr_npy_path)
     tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
     for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):
         print(image.shape, gt.shape, bboxes.shape)
@@ -238,11 +232,27 @@ def main():
         plt.savefig("./data_sanitycheck.png", bbox_inches="tight", dpi=300)
         plt.close()
         break
-    # Set up model
+
+    if args.use_wandb:
+        import wandb
+
+        wandb.login()
+        wandb.init(
+            project=args.task_name,
+            config={
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "data_path": args.tr_npy_path,
+                "model_type": args.model_type,
+            },
+        )
+
+    # %% set up model for training
+    # device = args.device
     run_id = datetime.now().strftime("%Y%m%d-%H%M")
     model_save_path = join(args.work_dir, args.task_name + "-" + run_id)
     device = torch.device(args.device)
-
+    # %% set up model
     os.makedirs(model_save_path, exist_ok=True)
     shutil.copyfile(
         __file__, join(model_save_path, run_id + "_" + os.path.basename(__file__))
@@ -261,7 +271,7 @@ def main():
     seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
     # cross entropy loss
     ce_loss = nn.BCEWithLogitsLoss(reduction="mean")
-    # train
+    # %% train
     num_epochs = args.num_epochs
     iter_num = 0
     losses = []
