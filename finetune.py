@@ -201,47 +201,59 @@ def main():
     parser.add_argument(
         "-task_name",
         type=str,
-        default="MedSAM-ViT-B"
+        default="MedSAM-ViT-B",
+        help="Task name. Useful for identification."
     )
     parser.add_argument(
         "-model_type",
         type=str,
-        default="vit_b"
+        default="vit_b",
+        help="""MedSAM model type. See MedSAM architecture and repository
+        for more details."""
     )
     parser.add_argument(
         "-checkpoint",
         type=str,
-        default="work_dir/MedSAM/medsam_vit_b.pth"
+        default="work_dir/MedSAM/medsam_vit_b.pth",
+        help="Path to the checkpoint pytorch model."
     )
     parser.add_argument(
         "-work_dir",
         type=str,
-        default="./work_dir"
+        default="./work_dir",
+        help="""Path to the directory to save output results. A new
+        folder is created inside."""
     )
     parser.add_argument(
         "-num_epochs",
         type=int,
-        default=1000
+        default=1000,
+        help="Epochs to train the model."
     )
     parser.add_argument(
         "-batch_size",
         type=int,
-        default=2
+        default=2,
+        help="Batch size for training."
     )
     parser.add_argument(
         "-val_batch_size",
         type=int,
-        default=1
+        default=1,
+        help="Batch size for validation."
     )
     parser.add_argument(
         "-num_workers",
         type=int,
-        default=0
+        default=0,
+        help="Number of workers."
     )
     parser.add_argument(
         "-weight_decay",
         type=float,
-        default=0.01
+        default=0.01,
+        help="""Weight decay. Regularization technique to penalize
+        large model weights."""
     )
     parser.add_argument(
         "-lr",
@@ -259,7 +271,8 @@ def main():
     parser.add_argument(
         "--use_amp",
         action="store_true",
-        default=False, help="Add this flag to use amp."
+        default=False,
+        help="Add this flag to use amp."
     )
     parser.add_argument(
         "--resume",
@@ -272,7 +285,9 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda:0"
+        default="cuda:0",
+        help="""Device for processing. Use 'cpu' to use CPU,
+        but using GPU is highly recommended."""
     )
     parser.add_argument(
         "--val_every",
