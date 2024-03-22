@@ -377,6 +377,7 @@ def main():
     num_epochs = args.num_epochs
     losses = []
     best_loss = 1e10
+    best_val_performance = -1e10
     datasets = {
         "train": NpyDataset(args.tr_npy_path)
     }
@@ -461,6 +462,7 @@ def main():
 
         if args.val_npy_path and epoch == validation_epoch:
             medsam_model.eval()
+            epoch_val_performance = 0
             if args.plot_val:
                 path_to_val_folder = Path(path_to_output_folder) / f"validation-epoch-{validation_epoch}"
                 path_to_val_folder.mkdir()
@@ -515,6 +517,7 @@ def main():
                         "loss": loss.item(),
                         "mean_dice_score": dice_batch_mean
                     })
+                    epoch_val_performance += dice_batch_mean
                     # Plot output segmentation for a random sample from the batch
                     if args.plot_val:
                         _, ax = plt.subplots(1, 3, figsize=(15, 5))
@@ -534,6 +537,7 @@ def main():
                         plt.close()
             with open(Path(path_to_output_folder) / "validation_performance.json", 'w') as file:
                 json.dump(validation_performance, file, indent=4)
+            epoch_val_performance /= (batch_idx + 1)
             validation_epoch += args.val_every
             medsam_model.train()
 
@@ -550,17 +554,37 @@ def main():
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
         }
-        torch.save(checkpoint, join(path_to_output_folder, "medsam_model_ft_latest.pth"))
+        torch.save(
+            checkpoint,
+            join(path_to_output_folder, "medsam_model_ft_latest.pth")
+        )
         # save the best model
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            checkpoint = {
-                "model": medsam_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
-            }
-            torch.save(checkpoint, join(path_to_output_folder, "medsam_model_ft_best.pth"))
-
+        if args.val_npy_path and epoch == validation_epoch:
+            if epoch_val_performance > best_val_performance:
+                best_val_performance = epoch_val_performance
+                checkpoint = {
+                    "model": medsam_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "val_performance": best_val_performance
+                }
+                torch.save(
+                    checkpoint,
+                    join(path_to_output_folder, "medsam_model_ft_best.pth")
+                )
+        elif not args.val_npy_path:
+            if epoch_loss < best_loss:
+                best_loss = epoch_loss
+                checkpoint = {
+                    "model": medsam_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "loss": best_loss
+                }
+                torch.save(
+                    checkpoint,
+                    join(path_to_output_folder, "medsam_model_ft_best.pth")
+                )
         # plot training loss
         plt.plot(losses)
         plt.title("Training loss")
