@@ -460,7 +460,9 @@ def main():
             optimizer.step()
             epoch_loss += loss.item()
 
-        if args.val_npy_path and epoch == validation_epoch:
+        is_validation_epoch = True if epoch == validation_epoch else False
+
+        if args.val_npy_path and is_validation_epoch:
             medsam_model.eval()
             epoch_val_performance = 0
             if args.plot_val:
@@ -559,7 +561,7 @@ def main():
             join(path_to_output_folder, "medsam_model_ft_latest.pth")
         )
         # save the best model
-        if args.val_npy_path and epoch == validation_epoch:
+        if args.val_npy_path and is_validation_epoch:
             if epoch_val_performance > best_val_performance:
                 best_val_performance = epoch_val_performance
                 checkpoint = {
