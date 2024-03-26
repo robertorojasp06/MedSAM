@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from skimage import io
 from tqdm import tqdm
+from matplotlib_scalebar.scalebar import ScaleBar
 
 
 DICE_LIMITS = [0, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
@@ -71,7 +72,8 @@ def extract_centered_patch(image, bbox, patch_size=(128, 128)):
 
 def main(path_to_performance, path_to_slices,
          path_to_output_masks, path_to_gt_masks,
-         path_to_labels, path_to_output):
+         path_to_labels, path_to_output, series_list,
+         scalebar):
     with open(path_to_performance, 'r') as file:
         performance = json.load(file)
     performance_df = pd.DataFrame(performance['bboxes'])
@@ -167,13 +169,22 @@ def main(path_to_performance, path_to_slices,
                 Path(path_to_output_mask_patches) /
                 f"{Path(path_to_output_mask).name}"
             )
+            series_uuid = Path(path_to_slice).name.split('_')[0]
+            row_size = [
+                series_["row_spacing"]
+                for series_ in series_list
+                if series_["uuid"] == series_uuid
+
+            ]
+            # Original slice
             _, ax = plt.subplots()
             ax.imshow(slice_array)
-            ax.set_title("slice",fontsize=16, fontweight='bold')
+            ax.set_title("slice", fontsize=16, fontweight='bold')
             ax.axis('off')
             plt.tight_layout()
             plt.savefig(path_to_output_slice, transparent=True)
             plt.close()
+            # Slice with overlapped masks (gt and prediction)
             _, ax = plt.subplots()
             ax.imshow(slice_array)
             show_mask((gt_mask > 0) * 1, ax)
@@ -183,6 +194,7 @@ def main(path_to_performance, path_to_slices,
             plt.tight_layout()
             plt.savefig(path_to_output_painted_slice)
             plt.close()
+            # Patch and Patch with overlapped masks
             _, ax = plt.subplots(nrows=1, ncols=2)
             ax[0].imshow(patch_image)
             ax[1].imshow(patch_image)
@@ -192,9 +204,17 @@ def main(path_to_performance, path_to_slices,
             ax[1].set_title(f"{labels.get(str(row['foreground_label']))} - dice score: {np.round(row['dice_score'], 3)}")
             ax[0].axis('off')
             ax[1].axis('off')
+            scalebar = ScaleBar(
+                row_size[0],
+                'mm',
+                location='lower right',
+                length_fraction=0.2
+            )
+            ax[0].add_artist(scalebar)
             plt.tight_layout()
             plt.savefig(path_to_output_image_mask_patch)
             plt.close()
+            # Patch
             _, ax = plt.subplots()
             ax.imshow(patch_image)
             ax.set_title("image", fontsize=16, fontweight='bold')
@@ -202,6 +222,7 @@ def main(path_to_performance, path_to_slices,
             plt.tight_layout()
             plt.savefig(path_to_output_image_patch, transparent=True)
             plt.close()
+            # Patch with overlapped masks
             _, ax = plt.subplots()
             ax.imshow(patch_image)
             show_mask((patch_gt_mask > 0) * 1, ax)
@@ -212,6 +233,13 @@ def main(path_to_performance, path_to_slices,
                 fontweight='bold'
             )
             ax.axis('off')
+            scalebar = ScaleBar(
+                row_size[0],
+                'mm',
+                location='lower right',
+                length_fraction=0.2
+            )
+            ax.add_artist(scalebar)
             plt.tight_layout()
             plt.savefig(path_to_output_mask_patch, transparent=True)
             plt.close()
@@ -245,6 +273,22 @@ if __name__ == "__main__":
         help="""Path to the directory to save the resulting plots.
         If None, 'path_to_results' is used."""
     )
+    parser.add_argument(
+        '--path_to_series',
+        type=str,
+        default=None,
+        help="""Path to the series.json file containing the metadata for
+        each series. This file is used to retrieve the pixel size for
+        scalebars. It assume the filenames in 'original_size' slices to
+        contain the "uuid" of the series before the first underscore.
+        If None, no scalebar is added."""
+    )
+    parser.add_argument(
+        '--scalebar',
+        type=float,
+        default=5.0,
+        help="Length of scalebar in centimeters."
+    )
     args = parser.parse_args()
     path_to_performance = Path(args.path_to_results) / "performance.json"
     path_to_slices = Path(args.path_to_results) / "original_size"
@@ -254,11 +298,18 @@ if __name__ == "__main__":
         path_to_output = Path(args.path_to_results) / "dice-grouped-segmentations"
     else:
         path_to_output = Path(args.path_to_output) / "dice-grouped-segmentations"
+    if args.path_to_series:
+        with open(args.path_to_series, 'r') as file:
+            series = json.load(file)
+    else:
+        series = None
     main(
         path_to_performance,
         path_to_slices,
         path_to_output_masks,
         path_to_gt_masks,
         args.path_to_labels,
-        path_to_output
+        path_to_output,
+        series,
+        args.scalebar
     )
