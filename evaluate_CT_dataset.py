@@ -100,7 +100,8 @@ class Evaluator:
         "abdomen": {"L": 40, "W": 350},
         "bone": {"L": 400, "W": 1000},
         "air": {"L": -426, "W": 1000},
-        "brain": {"L": 50, "W": 100}
+        "brain": {"L": 50, "W": 100},
+        "mediastinum": {"L": 50, "W": 350}
     }
 
     def __init__(self, path_to_cts, path_to_masks, path_to_output,

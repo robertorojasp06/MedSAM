@@ -466,7 +466,8 @@ if __name__ == "__main__":
         "abdomen": {"L": 40, "W": 350},
         "bone": {"L": 400, "W": 1000},
         "air": {"L": -426, "W": 1000},
-        "brain": {"L": 50, "W": 100}
+        "brain": {"L": 50, "W": 100},
+        "mediastinum": {"L": 50, "W": 350}
     }
     parser = argparse.ArgumentParser(
         description="""Evaluate MedSAM on elongated 2d objects annotated
