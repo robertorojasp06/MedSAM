@@ -182,7 +182,8 @@ if __name__ == "__main__":
         "abdomen": {"L": 40, "W": 350},
         "bone": {"L": 400, "W": 1000},
         "air": {"L": -426, "W": 1000},
-        "brain": {"L": 50, "W": 100}
+        "brain": {"L": 50, "W": 100},
+        "mediastinum": {"L": 50, "W": 350}
     }
     parser = argparse.ArgumentParser(
         description="""Run MedSAM inference on a set of 3D ROIs for
@@ -256,3 +257,6 @@ if __name__ == "__main__":
     # save output rois
     with open(Path(args.path_to_output) / f"{Path(args.path_to_ct).name.split('.nii.gz')[0]} output rois.pkl", 'wb') as file:
         pickle.dump(output_rois, file)
+    # save input args
+    with open(Path(args.path_to_output) / 'arguments.json', 'w') as file:
+        json.dump(vars(args), file, indent=4)

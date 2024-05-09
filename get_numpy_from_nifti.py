@@ -10,12 +10,13 @@ from tqdm import tqdm
 
 
 WINDOWS = {
-	        "lung": {"L": -500, "W": 1400},
-	        "abdomen": {"L": 40, "W": 350},
-	        "bone": {"L": 400, "W": 1000},
-	        "air": {"L": -426, "W": 1000},
-	        "brain": {"L": 50, "W": 100}
-	     }
+	"lung": {"L": -500, "W": 1400},
+	"abdomen": {"L": 40, "W": 350},
+	"bone": {"L": 400, "W": 1000},
+	"air": {"L": -426, "W": 1000},
+	"brain": {"L": 50, "W": 100},
+	"mediastinum": {"L": 50, "W": 350}
+}
 
 
 def show_mask(mask, ax, random_color=False):
