@@ -10,12 +10,13 @@ from tqdm import tqdm
 
 
 WINDOWS = {
-	        "lung": {"L": -500, "W": 1400},
-	        "abdomen": {"L": 40, "W": 350},
-	        "bone": {"L": 400, "W": 1000},
-	        "air": {"L": -426, "W": 1000},
-	        "brain": {"L": 50, "W": 100}
-	     }
+	"lung": {"L": -500, "W": 1400},
+	"abdomen": {"L": 40, "W": 350},
+	"bone": {"L": 400, "W": 1000},
+	"air": {"L": -426, "W": 1000},
+	"brain": {"L": 50, "W": 100},
+	"mediastinum": {"L": 50, "W": 350}
+}
 
 
 def show_mask(mask, ax, random_color=False):
@@ -49,8 +50,6 @@ def normalize_ct(ct_array, window=None, epsilon = 1e-6):
         )
         ct_array_pre[ct_array == 0] = 0
     return np.uint8(ct_array_pre)
-
-
 
 
 def main(path_to_root, path_to_output, windows_mapping,
@@ -122,8 +121,8 @@ def main(path_to_root, path_to_output, windows_mapping,
 				anti_aliasing=True
 			))
 			name = path_to_img.name.replace('.nii.gz', '')
-			name2save_img = Path(path_to_output_imgs) / f'{slice_idx}_{name}_img.npy'
-			name2save_seg = Path(path_to_output_gts) / f'{slice_idx}_{name}_seg.npy'
+			name2save_img = Path(path_to_output_imgs) / f'{slice_idx}_{name}.npy'
+			name2save_seg = Path(path_to_output_gts) / f'{slice_idx}_{name}.npy'
 			np.save(name2save_img, ct_slice_1024_3c)
 			np.save(name2save_seg, mask_slice_1024)
 
@@ -218,3 +217,5 @@ if __name__ == "__main__":
 		windows_mapping,
 		args.sanity_check
 	)
+	with open(Path(args.path_to_output) / 'arguments.json', 'w') as file:
+		json.dump(vars(args), file, indent=4)
