@@ -15,13 +15,9 @@ This step involves creating an output directory in the `results` directory. The 
 You can create all directories at once running the following lines in the terminal:
 
 ```
-find path/to/folder/with/models/folders/ -mindepth 1 -maxdepth 1 -type d | while read src; do folder_name=$(basename "$src") mkdir -p "path/to/output/folder/$folder_name" done
-```
-
-```
-find work_dir/MedSAM-HITL-iteration-3/ -mindepth 1 -maxdepth 1 -type d | while read src; do
+find path/to/folder/with/models/folders/ -mindepth 1 -maxdepth 1 -type d | while read src; do
     folder_name=$(basename "$src")
-    mkdir -p "results/MedSAM-HITL-iteration-3-last-models/$folder_name"
+    mkdir -p "path/to/output/folder/$folder_name"
 done
 ```
 
@@ -48,7 +44,10 @@ replacing `path/to/original/checkpoint` for the corresponding checkpoint file (u
 You can convert all files at once running the following in the terminal:
 
 ```
-find path/to/folder/with/models/folders/ -mindepth 1 -maxdepth 1 -type d | while read src; do folder_name=$(basename "$src") python utils/ckpt_convert.py "path/to/output/folder/$folder_name/medsam_model_ft_best.pth" done
+find path/to/folder/with/models/folders/ -mindepth 1 -maxdepth 1 -type d | while read src; do
+    folder_name=$(basename "$src")
+    python utils/ckpt_convert.py "path/to/output/folder/$folder_name/medsam_model_ft_best.pth"
+done
 ```
 
 replacing `path/to/folder/with/models/folders/` and `path/to/output/folder` with the corresponding paths.
