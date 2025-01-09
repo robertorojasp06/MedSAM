@@ -18,6 +18,13 @@ You can create all directories at once running the following lines in the termin
 find path/to/folder/with/models/folders/ -mindepth 1 -maxdepth 1 -type d | while read src; do folder_name=$(basename "$src") mkdir -p "path/to/output/folder/$folder_name" done
 ```
 
+```
+find work_dir/MedSAM-HITL-iteration-3/ -mindepth 1 -maxdepth 1 -type d | while read src; do
+    folder_name=$(basename "$src")
+    mkdir -p "results/MedSAM-HITL-iteration-3-last-models/$folder_name"
+done
+```
+
 replacing `path/to/folder/with/models/folders/` and `path/to/output/folder` with the corresponding paths.
 
 ## Convert format of checkpoint file
