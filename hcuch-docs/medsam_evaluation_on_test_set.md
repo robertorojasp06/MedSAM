@@ -14,7 +14,9 @@ This step involves creating an output directory in the `results` directory. The 
 
 You can create all directories at once running the following lines in the terminal:
 
-```find path/to/folder/with/models/folders/ -mindepth 1 -maxdepth 1 -type d | while read src; do folder_name=$(basename "$src") mkdir -p "path/to/output/folder/$folder_name" done```
+```
+find path/to/folder/with/models/folders/ -mindepth 1 -maxdepth 1 -type d | while read src; do folder_name=$(basename "$src") mkdir -p "path/to/output/folder/$folder_name" done
+```
 
 replacing `path/to/folder/with/models/folders/` and `path/to/output/folder` with the corresponding paths.
 
