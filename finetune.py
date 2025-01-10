@@ -69,7 +69,8 @@ def plot_validation_performance(validation_performance, path_to_output_file):
 
 
 class NpyDataset(Dataset):
-    def __init__(self, data_root, bbox_shift=5):
+    def __init__(self, data_root, bbox_shift=5,
+                 min_object_size_pixels=1):
         self.data_root = data_root
         self.gt_path = join(data_root, "gts")
         self.img_path = join(data_root, "imgs")
@@ -82,7 +83,7 @@ class NpyDataset(Dataset):
             if os.path.isfile(join(self.img_path, os.path.basename(file)))
         ]
         self.bbox_shift = bbox_shift
-        print(f"number of images: {len(self.gt_path_files)}")
+        self.min_object_size_pixels = min_object_size_pixels
 
     def __len__(self):
         return len(self.gt_path_files)
@@ -113,6 +114,13 @@ class NpyDataset(Dataset):
         assert np.max(gt2D) == 1 and np.min(gt2D) == 0.0, "ground truth should be 0, 1"
         # get bounding box for a random 2d object
         props = regionprops(label_objects(gt2D))
+        props = [
+            object_
+            for object_ in props
+            if object_.num_pixels >= self.min_object_size_pixels
+        ]
+        if len(props) == 0:
+            raise ValueError(f"mask in filename {self.gt_path_files[index]} only has small objects (less than {self.min_object_size_pixels} pixels in size)")
         random_object = np.random.choice(props)
         x_min, x_max = random_object['bbox'][1], random_object['bbox'][3]
         y_min, y_max = random_object['bbox'][0], random_object['bbox'][2]
@@ -301,6 +309,13 @@ def main():
         help="""Add this flag to plot segmentations obtained for the
         validation set."""
     )
+    parser.add_argument(
+        '--min_object_size',
+        type=int,
+        default=1,
+        help="""Minimum size in pixels of 2d objects to be
+        considered for training and evaluation."""
+    )
     args = parser.parse_args()
     run_id = datetime.now().strftime("%Y%m%d-%H%M")
     path_to_output_folder = join(args.work_dir, args.task_name + "-" + run_id)
@@ -308,7 +323,10 @@ def main():
 
     # sanity test of dataset class
     tr_dataloader = DataLoader(
-        NpyDataset(args.tr_npy_path),
+        NpyDataset(
+            args.tr_npy_path,
+            min_object_size_pixels=args.min_object_size
+        ),
         batch_size=8,
         shuffle=True
     )
@@ -379,7 +397,10 @@ def main():
     best_loss = 1e10
     best_val_performance = -1e10
     datasets = {
-        "train": NpyDataset(args.tr_npy_path)
+        "train": NpyDataset(
+            args.tr_npy_path,
+            min_object_size_pixels=args.min_object_size
+        )
     }
     print("Number of training samples: ", len(datasets["train"]))
     dataloaders = {
@@ -393,7 +414,10 @@ def main():
     }
     if args.val_npy_path:
         datasets.update({
-            "val": NpyDataset(args.val_npy_path)
+            "val": NpyDataset(
+                args.val_npy_path,
+                min_object_size_pixels=args.min_object_size
+            )
         })
         dataloaders.update({
             "val": DataLoader(
