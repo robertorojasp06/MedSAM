@@ -38,6 +38,7 @@ class Extractor:
             objects_data.append({
                 "filename": self._filename,
                 "slice_idx": slice_idx,
+                "lesion_instance_foreground_value": foreground_values[0],
                 "lesion_type": lesion_label.split(',')[0].strip(),
                 "lesion_location": lesion_label.split(',')[1].strip(),
                 "pixels_count": object_.num_pixels,
